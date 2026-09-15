@@ -1,4 +1,6 @@
-/kind
-# Own git repositories, not tracked here
-/deployments/secret-test/
-/deployments/basicservices/traefik/
+/cluster/kind
+/cluster/pki/out/
+/cli/kubeconfig
+/applications/secret-test/
+# Helm charts downloaded by "kubectl kustomize --enable-helm"
+charts/
