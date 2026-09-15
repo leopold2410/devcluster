@@ -18,6 +18,8 @@ services:
     environment:
       KUBECONFIG: /kube/config
       K9S_CONFIG_DIR: /k9s
+      # k9s needs $USER for its log location (the host UID has no passwd entry in the image)
+      USER: k9s
       # Port-forwards listen on all interfaces inside the container (default: localhost)
       K9S_DEFAULT_PF_ADDRESS: 0.0.0.0
       TERM: ${TERM:-xterm-256color}

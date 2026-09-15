@@ -8,6 +8,11 @@ kubeadmConfigPatches:
   kind: KubeletConfiguration
   evictionHard:
     nodefs.available: "0%"
+  # Docker storage on this host is ZFS. The kubelet (cAdvisor) can't read rootfs stats for a
+  # ZFS dataset inside a kind node and exits with "failed to get rootfs info" (kind#4229).
+  # Without local storage capacity isolation the kubelet skips that check;
+  # ephemeral-storage requests/limits are then not enforced.
+  localStorageCapacityIsolation: false
 nodes:
 - role: control-plane
 - role: worker

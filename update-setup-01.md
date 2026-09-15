@@ -4,7 +4,7 @@
 | --- | --- |
 | Date | 2026-09-15 |
 | Revision | 8: one Argo CD instance for the whole cluster (upstream `install.yaml` v3.5.3) instead of the Argo CD Operator. Earlier revisions: 7 repository layout and platform services as one Kustomize tree; 6 lazydocker; 5 k9s port-forwards; 4 k9s; 3 cert-manager, trust-manager, local CA; 2 ESO and Argo CD Operator |
-| Status | **Planned, not yet applied.** Tested in a scratch directory, without a cluster: `cluster/pki/create-ca.sh`, the `cli/` images and Compose setup, and a render of the complete `platformservices/` Kustomize tree |
+| Status | **Applied and verified on 2026-09-15** on branch `update-setup-01`. All step 10 checks passed (HTTP/HTTPS on all paths, STRICT mTLS, ESO, Argo CD with guestbook, k9s port-forward). Fixed while applying: the Traefik repo was moved instead of deleted (step 1); the ZFS kubelet setting (step 2c); the Gateway API `safe-upgrades` policy (step 3); `USER` for k9s (step 8). Still open, because it needs root: the host trust store and `/etc/hosts` (step 4, README *Browser access*) |
 | Scope | `/home/leo/dev/kind` |
 
 ## Goals
@@ -399,9 +399,11 @@ files. Commit a baseline first and do the update on a branch:
 cd /home/leo/dev/kind
 cat > .gitignore <<'EOF'
 /kind
+# Own git repositories, not tracked here
 /deployments/secret-test/
+/deployments/basicservices/traefik/
 EOF
-git init
+git init -b main
 git add -A
 git commit -m "Baseline before update-setup-01"
 git switch -c update-setup-01
@@ -468,18 +470,23 @@ git mv deployments/testapp                applications/testapp
 git mv deployments/basicservices/testhelm applications/testhelm
 mv deployments/secret-test applications/secret-test   # own git repository, not tracked here
 
-# replaced or no longer needed
-git rm -r -q deployments/basicservices/metallb deployments/basicservices/traefik \
-    deployments/basicservices/deploy.sh deployments/external-secrets-operator \
-    deployments/README.md platformservices/istio/deploy.sh logs.txt
-rmdir deployments/basicservices deployments
+# Traefik is its own git repository with unpushed changes: keep it, outside the project
+mv deployments/basicservices/traefik ~/dev/traefik
+
+# replaced or no longer needed (-f: istio/deploy.sh is a staged rename after the git mv above)
+git rm -r -q -f deployments/basicservices/metallb deployments/basicservices/deploy.sh \
+    deployments/external-secrets-operator deployments/README.md \
+    platformservices/istio/deploy.sh logs.txt
+find deployments -depth -type d -empty -delete
 ```
 
 What gets removed:
 - the MetalLB wrapper chart and the kustomize/native-manifest variant, with
   their hard-coded `172.22.255.x` pools;
-- Traefik, including its `v1alpha2` Gateway API CRDs (the cause of the conflict
-  with Istio), its default IngressClass and the metrics `IngressRoute`;
+- Traefik from the setup, including its `v1alpha2` Gateway API CRDs (the cause
+  of the conflict with Istio), its default IngressClass and the metrics
+  `IngressRoute`. Its folder is a separate git repository with unpushed changes,
+  so it moves to `~/dev/traefik` instead of being deleted;
 - the old ESO generator with its vendored 0.7.2 chart;
 - the Istio Helm script, which is replaced by Kustomize in step 5;
 - `deployments/README.md`, whose content moves into `README.md` in step 9;
@@ -550,6 +557,11 @@ kubeadmConfigPatches:
   kind: KubeletConfiguration
   evictionHard:
     nodefs.available: "0%"
+  # Docker storage on this host is ZFS. The kubelet (cAdvisor) can't read rootfs stats for a
+  # ZFS dataset inside a kind node and exits with "failed to get rootfs info" (kind#4229).
+  # Without local storage capacity isolation the kubelet skips that check;
+  # ephemeral-storage requests/limits are then not enforced.
+  localStorageCapacityIsolation: false
 nodes:
 - role: control-plane
 - role: worker
@@ -564,7 +576,18 @@ Compared with the current file:
   and the commented-out workers are removed;
 - 3 + 1 workers become 2;
 - the node image is **not** set here. `cluster.sh` passes it with `--image`, so
-  it's only pinned in `versions.env`.
+  it's only pinned in `versions.env`;
+- `localStorageCapacityIsolation: false` is added. This was found while applying
+  the plan: Docker's storage on this host is ZFS, and the kubelet exited with
+  `failed to get rootfs info: cannot find filesystem info for device "rpool/…"`,
+  so the control plane never started.
+  - The cause is cAdvisor v0.56.2, vendored by Kubernetes 1.36. For a ZFS
+    rootfs it calls the `zfs` command, which isn't in the node image, and has no
+    fallback (kind#4229). The fix is on cAdvisor master but not released.
+  - Kubernetes 1.36 only runs the fatal rootfs check when local storage capacity
+    isolation is on, so turning it off avoids the crash.
+  - Mounting `/dev/zfs` into the nodes would not help: the missing `zfs` command
+    is the problem.
 
 ## Step 3: cloud-provider-kind and Gateway API CRDs (`cluster/cluster.sh`)
 
@@ -591,6 +614,11 @@ up() {
     # it only creates missing CRDs and never updates them.
     kubectl apply --server-side -f \
         "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+    # The bundle's "safe-upgrades" admission policy rejects cloud-provider-kind's attempt to create
+    # its embedded (older) CRDs, and cloud-provider-kind then fails to start. Without the policy it
+    # gets "already exists" and keeps the version installed above.
+    kubectl delete validatingadmissionpolicybinding,validatingadmissionpolicy \
+        safe-upgrades.gateway.networking.k8s.io --ignore-not-found
 
     cpk_start
 
@@ -629,6 +657,16 @@ Notes:
   clusters if you run several.
 - Mounting `docker.sock` gives the container root-equivalent access to the host.
   That's acceptable for a local dev machine.
+- **The `safe-upgrades` admission policy is removed** right after the CRDs are
+  installed. This was found while applying the plan.
+  - The Gateway API v1.6.2 bundle includes a `ValidatingAdmissionPolicy` that
+    rejects installing older CRD versions.
+  - cloud-provider-kind v0.11.1 tries to *create* its embedded v1.5.0 CRDs at
+    startup. The policy denied that before the normal "already exists" answer
+    could come back, and cloud-provider-kind stopped with
+    `Failed to start cloud controller`.
+  - Without the policy, it logs `already exists, skipping creation` and our
+    v1.6.2 CRDs stay (verified).
 
 Check:
 
@@ -1450,7 +1488,7 @@ Istio gateway IP. On the vanilla path, each namespace gets its own IP anyway.
 
 | File | Change |
 | --- | --- |
-| `applications/secret-test/overlays/local/04-ingress.yaml` | `ingressClassName: traefik` → `cloud-provider-kind`; host `secret-test-web.minikube` → `secret-test-web.kind.local`; add annotation `cert-manager.io/cluster-issuer: kind-ca` and a `tls` block (`secretName: secret-test-web-tls`). **Commit inside the `secret-test` repo** |
+| `applications/secret-test/overlays/local/04-ingress.yaml` | `ingressClassName: traefik` → `cloud-provider-kind`; host `secret-test-web.minikube` → `secret-test-web.kind.local`; add annotation `cert-manager.io/cluster-issuer: kind-ca` and a `tls` block (`secretName: secret-test-web-tls`). **Left uncommitted in the `secret-test` repo for review**: it builds on an earlier uncommitted change there (annotation → `ingressClassName`) |
 | `applications/testhelm/values.yaml` | `ingress.className: "traefik"` → `"cloud-provider-kind"`; `ingress.annotations: {cert-manager.io/cluster-issuer: kind-ca}` |
 
 Both are deployed manually from their folders, e.g.
@@ -1552,6 +1590,8 @@ services:
     environment:
       KUBECONFIG: /kube/config
       K9S_CONFIG_DIR: /k9s
+      # k9s needs $USER for its log location (the host UID has no passwd entry in the image)
+      USER: k9s
       # Port-forwards listen on all interfaces inside the container (default: localhost)
       K9S_DEFAULT_PF_ADDRESS: 0.0.0.0
       TERM: ${TERM:-xterm-256color}
@@ -1903,8 +1943,9 @@ switching back to `main`:
 
 ```bash
 cluster/cluster.sh down
-mv applications/secret-test deployments/secret-test   # untracked, so git doesn't move it back
-git switch main                                       # restores the baseline layout and files
+git switch main                                        # restores the baseline layout and files
+mv applications/secret-test deployments/secret-test    # untracked, so git doesn't move it back
+mv ~/dev/traefik deployments/basicservices/traefik     # moved out in step 1
 curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x kind
 # Optional: remove the root CA from the host trust stores (step 4); cluster/pki/out/ can be deleted
 ```
@@ -1941,6 +1982,22 @@ curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x
 | `README.md` | updated (already contains *Trusting external CAs with trust-manager*) | 9 |
 
 ## Known limitations and open points
+
+**Cluster**
+- **Ephemeral storage isn't enforced.** `localStorageCapacityIsolation: false`
+  is needed because this host's Docker storage is ZFS (step 2c). Pods'
+  `ephemeral-storage` requests and limits are ignored, and nodes don't report
+  ephemeral-storage capacity. Remove the setting once a Kubernetes release
+  vendors a cAdvisor with the ZFS fallback (track kind#4229), or on hosts whose
+  Docker storage isn't ZFS.
+- **No Gateway API downgrade protection.** The bundle's `safe-upgrades`
+  admission policy is removed so cloud-provider-kind can start (step 3). Nothing
+  stops an accidental downgrade of the Gateway API CRDs any more; only
+  `cluster/cluster.sh` installs them.
+- **Low inotify limits on this host** (`max_user_instances=128`,
+  `max_user_watches=65536`). kind recommends 512 and 524288 against "too many
+  open files" errors in pods. Raising them needs root, e.g. in
+  `/etc/sysctl.d/99-kind.conf`.
 
 **Platform services (Kustomize)**
 - **`kubectl apply` doesn't prune.** Resources removed from the tree stay in the

@@ -16,6 +16,11 @@ up() {
     # it only creates missing CRDs and never updates them.
     kubectl apply --server-side -f \
         "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+    # The bundle's "safe-upgrades" admission policy rejects cloud-provider-kind's attempt to create
+    # its embedded (older) CRDs, and cloud-provider-kind then fails to start. Without the policy it
+    # gets "already exists" and keeps the version installed above.
+    kubectl delete validatingadmissionpolicybinding,validatingadmissionpolicy \
+        safe-upgrades.gateway.networking.k8s.io --ignore-not-found
 
     cpk_start
 
