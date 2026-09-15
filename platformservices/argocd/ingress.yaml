@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-web
+  annotations:
+    cert-manager.io/cluster-issuer: kind-ca   # -> Certificate + Secret argocd-web-tls
+spec:
+  ingressClassName: cloud-provider-kind
+  tls:
+  - hosts:
+    - argocd.kind.local
+    secretName: argocd-web-tls
+  rules:
+  - host: argocd.kind.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: argocd-server
+            port:
+              name: http

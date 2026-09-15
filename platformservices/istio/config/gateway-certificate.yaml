@@ -1,0 +1,14 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kind-local-wildcard
+  namespace: istio-system
+spec:
+  secretName: kind-local-wildcard-tls
+  dnsNames:
+  - "*.kind.local"
+  issuerRef:
+    kind: ClusterIssuer
+    name: kind-ca
+  duration: 2160h       # 90 days
+  renewBefore: 360h     # 15 days

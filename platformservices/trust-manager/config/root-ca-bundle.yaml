@@ -1,0 +1,13 @@
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: kind-root-ca            # name of the target ConfigMap in every namespace
+spec:
+  sources:
+  - configMap:
+      name: kind-root-ca-source # in the trust namespace (cert-manager); created by platformservices/deploy.sh
+      key: ca.crt
+  target:
+    configMap:
+      key: ca.crt
+    # no namespaceSelector -> all namespaces

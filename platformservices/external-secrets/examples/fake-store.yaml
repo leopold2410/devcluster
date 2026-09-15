@@ -1,0 +1,27 @@
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: fake
+spec:
+  provider:
+    fake:
+      data:
+      - key: /demo/greeting
+        value: hello-from-eso
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: demo
+  namespace: testapp
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: fake
+  target:
+    name: demo-secret
+  data:
+  - secretKey: greeting
+    remoteRef:
+      key: /demo/greeting

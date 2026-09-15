@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: testapp
+resources:
+- namespace.yaml
+- ../../base
+patches:
+- target:
+    kind: Ingress
+  patch: |-
+    - op: replace
+      path: /spec/rules/0/host
+      value: testapp.kind.local
+    - op: replace
+      path: /spec/tls/0/hosts/0
+      value: testapp.kind.local

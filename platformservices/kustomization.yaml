@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# All platform services in one render (update-setup-01):
+#   kubectl kustomize --enable-helm platformservices
+# Useful for review, diffs and as a future Argo CD source. It is NOT applied in one go:
+# CRDs and webhooks must be ready before the resources that use them, so
+# platformservices/deploy.sh applies the parts below one by one, in this order, with waits.
+resources:
+- cert-manager
+- trust-manager
+- cert-manager/config
+- trust-manager/config
+- istio
+- istio/gateway
+- istio/config
+- external-secrets
+- argocd

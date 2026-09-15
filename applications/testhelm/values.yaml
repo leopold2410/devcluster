@@ -42,8 +42,9 @@ service:
 
 ingress:
   enabled: false
-  className: "traefik"
-  annotations: {}
+  className: "cloud-provider-kind"
+  annotations:
+    cert-manager.io/cluster-issuer: kind-ca
   hosts:
     - host: chart-example.local
       paths:

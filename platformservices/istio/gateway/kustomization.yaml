@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Ingress gateway. Its pods get their proxy through istiod's injection webhook,
+# so apply only after istio/ (istiod) is ready.
+# Release name "istio-ingressgateway" -> Service istio-ingressgateway, label istio=ingressgateway,
+# which Istio uses for Kubernetes Ingress by default (meshConfig.ingressService).
+helmCharts:
+- name: gateway
+  repo: https://blob.istio.io/istio-release/charts
+  version: 1.31.0
+  releaseName: istio-ingressgateway
+  namespace: istio-system

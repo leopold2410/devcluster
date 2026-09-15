@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-vanilla
+  annotations:
+    cert-manager.io/cluster-issuer: kind-ca   # -> Certificate + Secret nginx-vanilla-tls in this namespace
+spec:
+  ingressClassName: cloud-provider-kind
+  tls:
+  - hosts:
+    - placeholder.kind.local                  # set per overlay
+    secretName: nginx-vanilla-tls
+  rules:
+  - host: placeholder.kind.local              # set per overlay
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx
+            port:
+              name: http

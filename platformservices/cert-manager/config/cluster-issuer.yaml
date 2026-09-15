@@ -1,0 +1,9 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: kind-ca
+spec:
+  ca:
+    # In the cluster resource namespace (cert-manager), created by platformservices/deploy.sh.
+    # tls.crt = issuing CA + root, so issued Secrets get the root as ca.crt
+    secretName: kind-issuing-ca

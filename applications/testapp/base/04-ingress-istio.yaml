@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-istio
+spec:
+  ingressClassName: istio
+  tls:
+  - hosts:
+    - placeholder.kind.local                  # set per overlay
+    secretName: kind-local-wildcard-tls       # Secret in istio-system (platformservices/istio/config)
+  rules:
+  - host: placeholder.kind.local              # set per overlay
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx
+            port:
+              name: http
