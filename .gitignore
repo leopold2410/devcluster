@@ -1,0 +1,4 @@
+/kind
+# Own git repositories, not tracked here
+/deployments/secret-test/
+/deployments/basicservices/traefik/
