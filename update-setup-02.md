@@ -390,10 +390,11 @@ openssl verify -CAfile "$PKI/root-ca.crt" -untrusted "$PKI/issuing-ca.crt" "$OUT
 
 ```yaml
 hostname: harbor.kind.local
+external_url: https://harbor.kind.local:3443   # non-default port -> Harbor must know it
 http:
-  port: 80
+  port: 3030
 https:
-  port: 443
+  port: 3443
   certificate: @OUT@/harbor-chain.crt
   private_key: @OUT@/harbor.key
 harbor_admin_password: @ADMIN_PASSWORD@
@@ -429,7 +430,7 @@ cd "$OUT/harbor"
 sudo ./prepare                 # renders docker-compose.yml and the nginx config
 docker compose up -d           # NOT ./install.sh: it requires the docker-compose v1 binary
 docker compose ps --format '{{.Name}}\t{{.Status}}'
-echo "Harbor: https://harbor.kind.local   user: admin   password: $HARBOR_ADMIN_PASSWORD"
+echo "Harbor: https://harbor.kind.local:3443   user: admin   password: $HARBOR_ADMIN_PASSWORD"
 ```
 
 Harbor sets `restart: always` on its containers, so it comes back after a
@@ -477,7 +478,7 @@ restart is needed, since containerd re-reads `certs.d` per pull.
 
 On the host, Docker also needs to trust Harbor for `docker login`/`docker push`.
 That works once the root CA is in the system trust store (update-setup-01,
-step 4). Otherwise: `sudo mkdir -p /etc/docker/certs.d/harbor.kind.local && sudo cp cluster/pki/out/root-ca.crt /etc/docker/certs.d/harbor.kind.local/ca.crt`.
+step 4). Otherwise: `sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443" && sudo cp cluster/pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"`.
 
 Add `harbor.kind.local` to `/etc/hosts` on the host with `./hosts.sh`, extended
 by a static entry, or manually:
@@ -521,10 +522,10 @@ kubectl get pvc lvm-test -w                    # capacity 2Gi
 **Registry:**
 
 ```bash
-docker login harbor.kind.local                 # admin + generated password
-docker pull busybox:1.36 && docker tag busybox:1.36 harbor.kind.local/library/busybox:1.36
-docker push harbor.kind.local/library/busybox:1.36
-kubectl run harbor-test --image=harbor.kind.local/library/busybox:1.36 --restart=Never -- sleep 60
+docker login harbor.kind.local:3443            # admin + generated password
+docker pull busybox:1.36 && docker tag busybox:1.36 harbor.kind.local:3443/library/busybox:1.36
+docker push harbor.kind.local:3443/library/busybox:1.36
+kubectl run harbor-test --image=harbor.kind.local:3443/library/busybox:1.36 --restart=Never -- sleep 60
 kubectl get pod harbor-test -w                 # Running = the node pulled from Harbor
 ```
 
@@ -557,7 +558,13 @@ drafts above in these points, all found while applying:
 - **`registry/create-cert.sh` is idempotent:** an existing certificate is kept
   while it matches the hostname and is valid for more than 30 days.
 - **The port check ignores Harbor itself.** It aborted when Harbor was already
-  listening on 80/443; now it only refuses when another service holds them.
+  listening on its ports; now it only refuses when another service holds them.
+- **Harbor moved to 3030/3443** (2026-09-16), so that 80 and 443 stay reserved on
+  the host for the cluster ingress. The ports live in `versions.env`
+  (`HARBOR_HTTP_PORT`, `HARBOR_HTTPS_PORT`), the script sets `external_url` so
+  Harbor generates URLs with the port, and `kind-trust.sh` writes the containerd
+  config under `certs.d/harbor.kind.local:3443/` - the port is part of the
+  registry name, so image tags carry it too.
 - **`registry/harbor.yml.tmpl` isn't used.** The script renders Harbor's own
   `harbor.yml.tmpl` from the installer and replaces only hostname, certificate
   paths, admin password and data volume, so it doesn't drift with Harbor versions.

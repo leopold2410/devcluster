@@ -117,13 +117,13 @@ Harbor runs on the host, so images outlive the cluster.
 ```mermaid
 flowchart LR
     subgraph hostside["Host"]
-        compose["Docker Compose project harbor<br/>9 containers, ports 80/443"]
+        compose["Docker Compose project harbor<br/>9 containers, ports 3030/3443"]
         cert["Server certificate harbor.kind.local<br/>issued by the local issuing CA"]
         prep["./prepare (root, one-time)<br/>renders configs and secrets"]
     end
     subgraph clusterside["kind cluster"]
-        containerd["containerd on every node<br/>/etc/containerd/certs.d/harbor.kind.local"]
-        pod["Pod pulls<br/>harbor.kind.local/library/..."]
+        containerd["containerd on every node<br/>/etc/containerd/certs.d/harbor.kind.local:3443"]
+        pod["Pod pulls<br/>harbor.kind.local:3443/library/..."]
     end
 
     prep --> compose
@@ -137,6 +137,10 @@ flowchart LR
   the nodes and the host verify it without exceptions.
 - **Name resolution:** `registry/kind-trust.sh` writes the `/etc/hosts` entry,
   the CA and `hosts.toml` into the nodes after every cluster creation.
+- **Ports:** Harbor listens on 3030/3443 so that 80 and 443 stay free on the host
+  for the cluster ingress. `external_url` makes Harbor put that port into the
+  URLs it generates, and the port becomes part of the registry name in every
+  image tag.
 - **Privileges:** only `prepare` needs root; running Harbor does not.
 
 ---

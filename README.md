@@ -414,8 +414,17 @@ docker compose -f registry/out/harbor/docker-compose.yml stop   # when you need 
 ```
 
 The admin password is in `registry/out/harbor/harbor.yml`
-(`harbor_admin_password`); the user is `admin`. Open https://harbor.kind.local
-after adding a hosts entry for the kind network gateway (see *Browser access*).
+(`harbor_admin_password`); the user is `admin`. Open
+https://harbor.kind.local:3443 after adding a hosts entry for the kind network
+gateway (see *Browser access*).
+
+**Harbor is on 3030/3443, not 80/443:** those host ports stay reserved for the
+cluster ingress. The HTTPS port is therefore part of the registry name, so images
+are tagged `harbor.kind.local:3443/library/...` and the nodes keep their
+containerd config under `/etc/containerd/certs.d/harbor.kind.local:3443/`. Both
+ports are set in `versions.env` (`HARBOR_HTTP_PORT`, `HARBOR_HTTPS_PORT`);
+changing them there and re-running `registry/setup-host.sh` re-renders Harbor's
+config, which also re-runs `prepare`.
 
 Privileges, worth knowing:
 - **Only `prepare` needs root.** It runs a `--privileged` container with your
@@ -432,10 +441,10 @@ Privileges, worth knowing:
 To push from your own Docker (optional, needs root once):
 
 ```bash
-sudo mkdir -p /etc/docker/certs.d/harbor.kind.local
-sudo cp cluster/pki/out/root-ca.crt /etc/docker/certs.d/harbor.kind.local/ca.crt
+sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443"
+sudo cp cluster/pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
 echo "172.21.0.1 harbor.kind.local" | sudo tee -a /etc/hosts
-docker login harbor.kind.local
+docker login harbor.kind.local:3443
 ```
 
 ## Known limitations
