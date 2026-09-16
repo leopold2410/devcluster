@@ -1,6 +1,11 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: dev
+# Registry (update-setup-02): let containerd read per-registry config from /etc/containerd/certs.d
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri".registry]
+    config_path = "/etc/containerd/certs.d"
 # Disable disk-pressure eviction (useful on a nearly full laptop disk)
 kubeadmConfigPatches:
 - |
@@ -14,6 +19,23 @@ kubeadmConfigPatches:
   # ephemeral-storage requests/limits are then not enforced.
   localStorageCapacityIsolation: false
 nodes:
+# TopoLVM (update-setup-02): a node's /dev is a tmpfs copy, so LVM devices need the host's /dev;
+# /run/topolvm carries the lvmd socket from the host (storage/setup-host.sh)
 - role: control-plane
+  extraMounts:
+  - hostPath: /dev
+    containerPath: /dev
+  - hostPath: /run/topolvm
+    containerPath: /run/topolvm
 - role: worker
+  extraMounts:
+  - hostPath: /dev
+    containerPath: /dev
+  - hostPath: /run/topolvm
+    containerPath: /run/topolvm
 - role: worker
+  extraMounts:
+  - hostPath: /dev
+    containerPath: /dev
+  - hostPath: /run/topolvm
+    containerPath: /run/topolvm

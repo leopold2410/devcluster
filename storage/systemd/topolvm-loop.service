@@ -1,0 +1,16 @@
+[Unit]
+Description=Loop device and volume group for TopoLVM
+DefaultDependencies=no
+After=local-fs.target
+Before=lvmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=BACKING_FILE=/var/lib/topolvm/backing.img
+Environment=VG=topolvm-vg
+ExecStart=/bin/sh -c 'losetup -j "$BACKING_FILE" | grep -q . || losetup --find "$BACKING_FILE"; vgchange -ay "$VG"'
+ExecStop=/bin/sh -c 'vgchange -an "$VG" || true; loop=$(losetup -j "$BACKING_FILE" | cut -d: -f1); [ -n "$loop" ] && losetup -d "$loop" || true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+socket-name: /run/topolvm/lvmd.sock
+device-classes:
+  - name: local
+    volume-group: topolvm-vg
+    default: true
+    spare-gb: 5
+# Snapshots and clones need a thin pool. Create it once on the host:
+#   sudo lvcreate --type thin-pool -L 20G -n thinpool topolvm-vg
+# then add and restart lvmd:
+#  - name: local-thin
+#    volume-group: topolvm-vg
+#    type: thin
+#    thin-pool:
+#      name: thinpool
+#      overprovision-ratio: 5.0

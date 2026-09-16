@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: topolvm-system
+  labels:
+    istio-injection: disabled
+    # TopoLVM's node pods are privileged; explicit in case Pod Security is enforced later
+    pod-security.kubernetes.io/enforce: privileged

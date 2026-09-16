@@ -4,3 +4,5 @@
 /applications/secret-test/
 # Helm charts downloaded by "kubectl kustomize --enable-helm"
 charts/
+# Harbor installer, certificates and data
+/registry/out/

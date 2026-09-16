@@ -37,7 +37,13 @@ apply trust-manager;        available cert-manager
 apply cert-manager/config;  kubectl wait clusterissuer/kind-ca --for=condition=Ready --timeout=60s
 apply trust-manager/config
 
-# 2. Istio: CRDs + istiod (reads cacerts at startup), then the gateway (needs istiod's injection webhook)
+# 2. TopoLVM (lvmd runs on the host, see storage/); its webhook certificate comes from cert-manager
+[[ -S /run/topolvm/lvmd.sock ]] || { echo "missing /run/topolvm/lvmd.sock - run 'sudo storage/setup-host.sh' first" >&2; exit 1; }
+apply topolvm;              available topolvm-system
+# TopoLVM becomes the default StorageClass; kind's local-path stays available
+kubectl annotate storageclass standard storageclass.kubernetes.io/is-default-class=false --overwrite
+
+# 3. Istio: CRDs + istiod (reads cacerts at startup), then the gateway (needs istiod's injection webhook)
 apply istio;                available istio-system
 apply istio/gateway;        available istio-system
 apply istio/config

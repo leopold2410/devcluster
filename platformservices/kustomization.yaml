@@ -10,6 +10,7 @@ resources:
 - trust-manager
 - cert-manager/config
 - trust-manager/config
+- topolvm
 - istio
 - istio/gateway
 - istio/config

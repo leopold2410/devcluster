@@ -1,0 +1,14 @@
+[Unit]
+Description=lvmd for TopoLVM
+Wants=lvm2-monitor.service topolvm-loop.service
+After=lvm2-monitor.service topolvm-loop.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartForceExitStatus=SIGPIPE
+ExecStartPre=/bin/mkdir -p /run/topolvm
+ExecStart=/opt/sbin/lvmd --config=/etc/topolvm/lvmd.yaml
+
+[Install]
+WantedBy=multi-user.target
