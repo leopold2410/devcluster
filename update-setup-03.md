@@ -178,7 +178,7 @@ Start with option 1, measure the start time, then decide.
 ## Step 2: Certificate and secrets
 
 `identity/create-cert.sh` mirrors `registry/create-cert.sh`: a server certificate
-for `keycloak.kind.local` from `cluster/pki/out/issuing-ca.*`, written to
+for `keycloak.kind.local` from `pki/out/issuing-ca.*`, written to
 `identity/out/tls/tls.crt` (with the issuing CA appended) and `tls.key`, and
 skipped when a valid certificate is already there.
 
@@ -333,7 +333,7 @@ existing `argocd-cmd-params-cm` patch:
         cliClientID: argocd
         requestedScopes: ["openid", "profile", "email", "groups"]
         rootCA: |
-          <content of cluster/pki/out/root-ca.crt>
+          <content of pki/out/root-ca.crt>
 - patch: |-
     apiVersion: v1
     kind: ConfigMap
@@ -355,7 +355,7 @@ kubectl -n argocd patch secret argocd-secret \
 ```
 
 - **The root certificate is public**, so it may live in the manifest; to avoid
-  duplicating it, `deploy.sh` can inject it from `cluster/pki/out/root-ca.crt`.
+  duplicating it, `deploy.sh` can inject it from `pki/out/root-ca.crt`.
 
 ## Step 6: Harbor as an OIDC client
 
@@ -365,7 +365,7 @@ instance), so `registry/oidc-setup.sh` can script it:
 
 ```bash
 curl -u "admin:$HARBOR_ADMIN_PASSWORD" -X PUT \
-  --cacert cluster/pki/out/root-ca.crt --resolve harbor.kind.local:3443:127.0.0.1 \
+  --cacert pki/out/root-ca.crt --resolve harbor.kind.local:3443:127.0.0.1 \
   https://harbor.kind.local:3443/api/v2.0/configurations \
   -H 'Content-Type: application/json' -d '{
     "auth_mode": "oidc_auth",
@@ -392,7 +392,7 @@ Two things have to be true for this to work:
   certificate goes there:
 
 ```bash
-cp cluster/pki/out/root-ca.crt registry/out/harbor/common/config/shared/trust-certificates/
+cp pki/out/root-ca.crt registry/out/harbor/common/config/shared/trust-certificates/
 docker compose -f registry/out/harbor/docker-compose.yml restart core jobservice
 ```
 
@@ -404,7 +404,7 @@ from the user profile, not the Keycloak password.
 
 ```bash
 # Keycloak reachable, issuer correct
-curl -s --cacert cluster/pki/out/root-ca.crt https://keycloak.kind.local:8443/realms/platform/.well-known/openid-configuration \
+curl -s --cacert pki/out/root-ca.crt https://keycloak.kind.local:8443/realms/platform/.well-known/openid-configuration \
   | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["issuer"]); print(d["authorization_endpoint"])'
 
 # Reachable from inside the cluster (CoreDNS + certificate)
@@ -416,7 +416,7 @@ argocd login argocd.kind.local --sso --grpc-web
 argocd account get-user-info          # shows groups: [platform-admins]
 
 # Harbor: browser login via Keycloak; a user in platform-admins is an administrator
-curl -s -u "admin:$PW" --cacert cluster/pki/out/root-ca.crt --resolve harbor.kind.local:3443:127.0.0.1 \
+curl -s -u "admin:$PW" --cacert pki/out/root-ca.crt --resolve harbor.kind.local:3443:127.0.0.1 \
   https://harbor.kind.local:3443/api/v2.0/configurations | grep -o '"auth_mode":{[^}]*}'
 ```
 

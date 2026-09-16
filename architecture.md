@@ -45,7 +45,7 @@ C4Container
         Container(lvmd, "lvmd", "systemd unit, gRPC over a Unix socket", "Creates and resizes LVM volumes for TopoLVM")
         ContainerDb(vg, "Volume group topolvm-vg", "LVM on a loop-backed file", "Backing store of all node volumes")
         Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA")
-        ContainerDb(pki, "Local PKI", "OpenSSL files in cluster/pki/out", "Root CA plus intermediates for cert-manager and the Istio mesh")
+        ContainerDb(pki, "Local PKI", "OpenSSL files in pki/out", "Root CA plus intermediates for cert-manager, the Istio mesh and the host-side services")
     }
 
     System_Boundary(cluster, "kind cluster dev (Kubernetes 1.36)") {
@@ -77,7 +77,7 @@ C4Container
     Rel(lvmd, vg, "Manages logical volumes", "LVM")
     Rel(apps, vg, "Mounts volumes", "XFS on /dev/mapper")
 
-    Rel(certmgr, pki, "Signs with the issuing CA", "Secret from cluster/pki")
+    Rel(certmgr, pki, "Signs with the issuing CA", "Secret from pki")
     Rel(istio, pki, "Mesh certificates from the mesh CA", "Secret cacerts")
     Rel(trustmgr, apps, "Provides the root certificate", "ConfigMap per namespace")
     Rel(argocd, guestbook, "Deploys into any namespace", "Kubernetes API")

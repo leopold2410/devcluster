@@ -86,7 +86,7 @@ Where the current files go:
 | Current | New |
 | --- | --- |
 | `kind`, `cluster-config.yaml`, `cluster.sh` | `cluster/` |
-| — (new) | `cluster/pki/` |
+| — (new) | `pki/` |
 | — (new) | `cli/` |
 | `deployments/basicservices/istio/` | `platformservices/istio/` (Helm script replaced by Kustomize) |
 | `deployments/basicservices/argocd/` | `platformservices/argocd/` (v2.5.8 manifest replaced by the upstream v3.5.3 install through Kustomize) |
@@ -105,7 +105,7 @@ Where the current files go:
 ```
 Host (Linux)
 │
-├── cluster/pki/out/ (git-ignored)   kind-dev Root CA ── root key can be moved offline
+├── pki/out/ (git-ignored)   kind-dev Root CA ── root key can be moved offline
 │                                       ├── kind-dev Issuing CA    → cert-manager ClusterIssuer "kind-ca"
 │                                       └── kind-dev Istio Mesh CA → Istio plug-in CA (secret "cacerts")
 │   Host trust store: kind-dev Root CA (name-constrained to kind.local / svc / cluster.local / localhost)
@@ -162,7 +162,7 @@ each version lives in exactly one place.
 | Argo CD | v2.5.8 | **v3.5.3** | Latest release (2026-09-14). Argo CD tests 3.5 with Kubernetes 1.33–1.36. Upstream `install.yaml` through Kustomize, no operator |
 | k9s | — | **v0.51.0** | Latest release (2026-06-06). Built into a local image, because Docker Hub's `derailed/k9s` only goes up to v0.50.18 and bundles kubectl v1.32.2 |
 | lazydocker | — | **v0.25.2** | Latest release (2026-04-19). Built into a local image, because Docker Hub's `lazyteam/lazydocker` was last updated in 2022. The image contains Alpine's `docker-cli` 29.5.2 and `docker-cli-compose` 2.40.3 |
-| OpenSSL (host) | 3.0.13 | — | Used by `cluster/pki/create-ca.sh` |
+| OpenSSL (host) | 3.0.13 | — | Used by `pki/create-ca.sh` |
 | Docker Compose (host) | v5.3.0 | — | Used by `cli/` |
 
 Design decisions:
@@ -202,7 +202,7 @@ Design decisions:
     directories (`<service>/` and `<service>/config/`).
 - **The secrets from the local PKI are deliberately not part of Kustomize.** They
   would show up in every render, and they must never reach git.
-  `platformservices/deploy.sh` creates them from `cluster/pki/out/`.
+  `platformservices/deploy.sh` creates them from `pki/out/`.
 - **Trade-offs compared with `helm upgrade --install`** (the previous revisions):
   - there's no Helm release history and no `helm rollback`;
   - there's no `--wait`; `deploy.sh` waits instead;
@@ -496,14 +496,14 @@ New `.gitignore`:
 
 ```
 /cluster/kind
-/cluster/pki/out/
+/pki/out/
 /cli/kubeconfig
 /applications/secret-test/
 # Helm charts downloaded by "kubectl kustomize --enable-helm"
 charts/
 ```
 
-`cluster/pki/out/` holds private keys and `cli/kubeconfig` holds cluster-admin
+`pki/out/` holds private keys and `cli/kubeconfig` holds cluster-admin
 credentials; neither may ever be committed.
 
 ```bash
@@ -678,14 +678,14 @@ kubectl get gatewayclass          # cloud-provider-kind
 kubectl get crd | grep gateway.networking.k8s.io
 ```
 
-## Step 4: Local PKI with OpenSSL (`cluster/pki/`)
+## Step 4: Local PKI with OpenSSL (`pki/`)
 
 This runs once, independently of the cluster lifecycle.
-`cluster/cluster.sh down` does **not** touch `cluster/pki/out/`, so a recreated
+`cluster/cluster.sh down` does **not** touch `pki/out/`, so a recreated
 cluster reuses the same root CA, and the host trust stays valid.
 
 ```
-cluster/pki/
+pki/
 ├── create-ca.sh              # committed
 └── out/                      # git-ignored, created by the script
     ├── root-ca.crt           # kind-dev Root CA (10 years, name-constrained); public
@@ -696,7 +696,7 @@ cluster/pki/
     └── istio-ca-chain.crt    # istio-ca + root (cert-chain.pem)
 ```
 
-**New file `cluster/pki/create-ca.sh`.** This exact script was tested on this
+**New file `pki/create-ca.sh`.** This exact script was tested on this
 host (OpenSSL 3.0.13):
 - the chain verifies;
 - re-running it doesn't change existing keys or certificates;
@@ -756,8 +756,8 @@ openssl verify -CAfile root-ca.crt issuing-ca.crt istio-ca.crt
 Run it and inspect the result:
 
 ```bash
-cluster/pki/create-ca.sh          # expect: issuing-ca.crt: OK / istio-ca.crt: OK
-openssl x509 -in cluster/pki/out/root-ca.crt -noout -subject -enddate -ext nameConstraints
+pki/create-ca.sh          # expect: issuing-ca.crt: OK / istio-ca.crt: OK
+openssl x509 -in pki/out/root-ca.crt -noout -subject -enddate -ext nameConstraints
 ```
 
 **Keep the root key offline.** This is recommended once both intermediates
@@ -766,10 +766,10 @@ re-issued:
 
 ```bash
 # Option A: move it to offline storage (encrypted USB stick, password manager, ...)
-mv cluster/pki/out/root-ca.key /path/to/offline/storage/
+mv pki/out/root-ca.key /path/to/offline/storage/
 # Option B: keep an encrypted copy only
-openssl pkey -in cluster/pki/out/root-ca.key -aes256 -out cluster/pki/out/root-ca.key.enc \
-    && shred -u cluster/pki/out/root-ca.key
+openssl pkey -in pki/out/root-ca.key -aes256 -out pki/out/root-ca.key.enc \
+    && shred -u pki/out/root-ca.key
 ```
 
 **Trust the root CA on the host.** This is safe because of the name constraints,
@@ -777,10 +777,10 @@ which OpenSSL, Go and current browsers enforce.
 
 ```bash
 # System store (curl, wget, Go/Python tools, ...) - Debian/Ubuntu
-sudo cp cluster/pki/out/root-ca.crt /usr/local/share/ca-certificates/kind-dev-root-ca.crt
+sudo cp pki/out/root-ca.crt /usr/local/share/ca-certificates/kind-dev-root-ca.crt
 sudo update-ca-certificates
 # Chrome / Chromium (NSS database)
-certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i cluster/pki/out/root-ca.crt
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i pki/out/root-ca.crt
 # Firefox: Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import
 ```
 
@@ -1261,8 +1261,8 @@ allow those namespaces in an `AppProject` (`spec.sourceNamespaces`).
 # One render of the whole platform: kubectl kustomize --enable-helm platformservices
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-PKI="$SCRIPT_DIR/../cluster/pki/out"
-[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run cluster/pki/create-ca.sh first" >&2; exit 1; }
+PKI="$SCRIPT_DIR/../pki/out"
+[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run pki/create-ca.sh first" >&2; exit 1; }
 
 apply() {       # $1 = kustomization directory below platformservices/
     echo "--- platformservices/$1"
@@ -1815,7 +1815,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 ```bash
 cd /home/leo/dev/kind
-cluster/pki/create-ca.sh      # once
+pki/create-ca.sh      # once
 cluster/cluster.sh up
 ./deploy.sh
 ```
@@ -1844,7 +1844,7 @@ kubectl -n testapp-mesh get configmap istio-ca-root-cert -o jsonpath='{.data.roo
 **Ingress paths, HTTP and HTTPS.** HTTPS is checked against the local root:
 
 ```bash
-CA=cluster/pki/out/root-ca.crt
+CA=pki/out/root-ca.crt
 ISTIO_IP=$(kubectl -n istio-system get svc istio-ingressgateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 for ns in testapp testapp-mesh; do
   H=$ns.kind.local
@@ -1901,7 +1901,7 @@ kubectl -n testapp get secret demo-secret -o jsonpath='{.data.greeting}' | base6
 kubectl -n argocd get pods                         # application-controller-0, applicationset-controller, dex-server,
                                                    # notifications-controller, redis, repo-server, server: Running
 ARGO_IP=$(kubectl -n argocd get ingress argocd-web -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-curl -s -o /dev/null -w "argocd %{http_code}\n" --cacert cluster/pki/out/root-ca.crt \
+curl -s -o /dev/null -w "argocd %{http_code}\n" --cacert pki/out/root-ca.crt \
      --resolve "argocd.kind.local:443:$ARGO_IP" https://argocd.kind.local/   # 200
 kubectl apply -f platformservices/argocd/examples/guestbook.yaml
 kubectl -n argocd get application guestbook        # SYNC STATUS Synced, HEALTH Healthy
@@ -1947,7 +1947,7 @@ git switch main                                        # restores the baseline l
 mv applications/secret-test deployments/secret-test    # untracked, so git doesn't move it back
 mv ~/dev/traefik deployments/basicservices/traefik     # moved out in step 1
 curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x kind
-# Optional: remove the root CA from the host trust stores (step 4); cluster/pki/out/ can be deleted
+# Optional: remove the root CA from the host trust stores (step 4); pki/out/ can be deleted
 ```
 
 ## Summary of changes
@@ -1955,15 +1955,15 @@ curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x
 | Path | Action | Step |
 | --- | --- | --- |
 | git repository, branch `update-setup-01` | new (baseline commit on `main`) | 0 |
-| `.gitignore` | new (`/cluster/kind`, `/cluster/pki/out/`, `/cli/kubeconfig`, `/applications/secret-test/`, `charts/`) | 1 |
+| `.gitignore` | new (`/cluster/kind`, `/pki/out/`, `/cli/kubeconfig`, `/applications/secret-test/`, `charts/`) | 1 |
 | `deployments/` | dissolved into `cluster/`, `platformservices/`, `applications/`; MetalLB, Traefik, old ESO generator, `basicservices/deploy.sh`, `README.md` deleted | 1 |
 | `logs.txt` | deleted | 1 |
 | `cluster/kind` | moved and replaced: v0.20.0 → v0.33.0 | 1, 2 |
 | `versions.env` | new (kind, node image, kubectl, cloud-provider-kind, Gateway API, k9s, lazydocker) | 2 |
 | `cluster/cluster-config.yaml` | moved and rewritten (1 CP + 2 workers, no port mappings, labels or certSAN patch) | 1, 2 |
 | `cluster/cluster.sh` | moved and rewritten (`up`/`down`/`cpk`; Gateway API CRDs; cloud-provider-kind container; writes/removes `cli/kubeconfig`) | 1, 3 |
-| `cluster/pki/create-ca.sh` | new (root CA + issuing CA + Istio mesh CA, name-constrained, idempotent) | 4 |
-| `cluster/pki/out/` | generated, git-ignored | 4 |
+| `pki/create-ca.sh` | new (root CA + issuing CA + Istio mesh CA, name-constrained, idempotent) | 4 |
+| `pki/out/` | generated, git-ignored | 4 |
 | Host trust stores | root CA added (system store, NSS, Firefox) | 4 |
 | `platformservices/kustomization.yaml` | new (aggregate of all parts) | 5a |
 | `platformservices/cert-manager/` | new: `kustomization.yaml` (chart v1.21.2), `namespace.yaml`, `config/` (ClusterIssuer) | 5b |
@@ -2035,7 +2035,7 @@ curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x
   Step 10 checks this explicitly. If it fails, the Istio path still gives HTTPS.
 
 **Certificates**
-- **`root-ca.key` is on disk in `cluster/pki/out/` after the first run.** Move it
+- **`root-ca.key` is on disk in `pki/out/` after the first run.** Move it
   offline or encrypt it (step 4); it's only needed to re-issue intermediates.
 - **Intermediate CA keys live in cluster Secrets** (`cert-manager/kind-issuing-ca`,
   `istio-system/cacerts`). That's normal for an in-cluster CA; anyone with

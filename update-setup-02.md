@@ -89,7 +89,7 @@ HARBOR_VERSION=v2.15.2
   cloud-provider-kind: it outlives the cluster, so images survive
   `cluster/cluster.sh down`.
 - **TLS from the local CA:** a server certificate for `harbor.kind.local`,
-  issued by `kind-dev Issuing CA` from `cluster/pki/`. The root CA is
+  issued by `kind-dev Issuing CA` from `pki/`. The root CA is
   name-constrained to `kind.local`, so this works. Anything that already trusts
   the root CA (this host, after step 4 of update-setup-01) trusts Harbor.
 - **The cluster reaches Harbor over the kind network.** The nodes get an
@@ -360,7 +360,7 @@ kubectl annotate storageclass standard storageclass.kubernetes.io/is-default-cla
 ## Step 4: `registry/` — certificate and Harbor
 
 **`registry/create-cert.sh`:** issues a server certificate for
-`harbor.kind.local` from `cluster/pki/out/issuing-ca.*`, writing
+`harbor.kind.local` from `pki/out/issuing-ca.*`, writing
 `registry/out/harbor.key` and `registry/out/harbor-chain.crt` (server
 certificate plus issuing CA, which Harbor's nginx needs):
 
@@ -369,9 +369,9 @@ certificate plus issuing CA, which Harbor's nginx needs):
 # Server certificate for harbor.kind.local from the local CA (update-setup-02)
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-PKI="$SCRIPT_DIR/../cluster/pki/out"
+PKI="$SCRIPT_DIR/../pki/out"
 OUT="$SCRIPT_DIR/out"
-[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run cluster/pki/create-ca.sh first" >&2; exit 1; }
+[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run pki/create-ca.sh first" >&2; exit 1; }
 mkdir -p "$OUT"; umask 077
 openssl req -new -newkey rsa:2048 -nodes -sha256 \
     -keyout "$OUT/harbor.key" -out "$OUT/harbor.csr" -subj "/O=kind-dev/CN=harbor.kind.local"
@@ -454,7 +454,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../versions.env"
 KIND="$SCRIPT_DIR/../cluster/kind"
-CA="$SCRIPT_DIR/../cluster/pki/out/root-ca.crt"
+CA="$SCRIPT_DIR/../pki/out/root-ca.crt"
 # Address of the host on the kind network
 HOST_IP=$(docker network inspect kind -f '{{range .IPAM.Config}}{{if not (eq .Gateway "")}}{{.Gateway}}{{end}}{{end}}')
 echo "harbor.kind.local -> $HOST_IP"
@@ -478,7 +478,7 @@ restart is needed, since containerd re-reads `certs.d` per pull.
 
 On the host, Docker also needs to trust Harbor for `docker login`/`docker push`.
 That works once the root CA is in the system trust store (update-setup-01,
-step 4). Otherwise: `sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443" && sudo cp cluster/pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"`.
+step 4). Otherwise: `sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443" && sudo cp pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"`.
 
 Add `harbor.kind.local` to `/etc/hosts` on the host with `./hosts.sh`, extended
 by a static entry, or manually:

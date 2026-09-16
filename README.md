@@ -19,7 +19,7 @@ history: commit `ada2a79`).
 ## Quick start
 
 ```bash
-cluster/pki/create-ca.sh      # once: local root CA + intermediates (cluster/pki/out/, git-ignored)
+pki/create-ca.sh      # once: local root CA + intermediates (pki/out/, git-ignored)
 sudo storage/setup-host.sh    # once: LVM volume group on a loop file + lvmd as a systemd unit
 cluster/cluster.sh up         # kind cluster, Gateway API CRDs, cloud-provider-kind
 ./deploy.sh                   # platform services, then test applications
@@ -46,7 +46,8 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 ├── deploy.sh             # platformservices/deploy.sh, then applications/deploy.sh
 ├── hosts.sh              # *.kind.local Ingress hosts -> /etc/hosts (managed block)
 ├── cluster/              # kind binary (git-ignored), cluster-config.yaml, cluster.sh (up | down | cpk)
-│   └── pki/              # create-ca.sh; out/ holds the CA keys (git-ignored)
+├── pki/                  # create-ca.sh; out/ holds the CA keys (git-ignored). Used by the cluster
+│                         # and by the host-side services (Harbor, later Keycloak)
 ├── platformservices/     # one Kustomize tree; Helm charts via helmCharts
 │   ├── kustomization.yaml    # renders everything: kubectl kustomize --enable-helm platformservices
 │   ├── deploy.sh             # applies the parts in dependency order
@@ -99,9 +100,9 @@ without certificate warnings, do these once (both need root):
 
 ```bash
 # 1. Trust the local root CA (name-constrained to kind.local, svc, cluster.local, localhost)
-sudo cp cluster/pki/out/root-ca.crt /usr/local/share/ca-certificates/kind-dev-root-ca.crt
+sudo cp pki/out/root-ca.crt /usr/local/share/ca-certificates/kind-dev-root-ca.crt
 sudo update-ca-certificates
-certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i cluster/pki/out/root-ca.crt  # Chrome/Chromium (libnss3-tools)
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i pki/out/root-ca.crt  # Chrome/Chromium (libnss3-tools)
 # Firefox: Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import
 
 # 2. Host names -> Ingress IPs: all *.kind.local Ingress hosts into a managed block in /etc/hosts
@@ -192,13 +193,13 @@ still works: the vanilla path gets `503` and L4 a reset connection (verified).
 
 ## Certificates
 
-- **Local PKI (`cluster/pki/create-ca.sh`):**
+- **Local PKI (`pki/create-ca.sh`):**
   - `kind-dev Root CA`: 10 years, name-constrained to `kind.local`, `svc`,
     `cluster.local` and `localhost`;
   - two intermediates (3 years): `kind-dev Issuing CA` for cert-manager and
     `kind-dev Istio Mesh CA` for Istio;
   - the root key is only needed to issue intermediates, so move
-    `cluster/pki/out/root-ca.key` offline.
+    `pki/out/root-ca.key` offline.
 - **cert-manager:** ClusterIssuer `kind-ca`. Annotate an Ingress with
   `cert-manager.io/cluster-issuer: kind-ca` and give it a `tls` block.
 - **trust-manager:** the Bundle `kind-root-ca` puts the root certificate into
@@ -442,7 +443,7 @@ To push from your own Docker (optional, needs root once):
 
 ```bash
 sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443"
-sudo cp cluster/pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
+sudo cp pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
 echo "172.21.0.1 harbor.kind.local" | sudo tee -a /etc/hosts
 docker login harbor.kind.local:3443
 ```

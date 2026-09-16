@@ -3,10 +3,10 @@
 # Usage: registry/create-cert.sh
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-PKI="$SCRIPT_DIR/../cluster/pki/out"
+PKI="$SCRIPT_DIR/../pki/out"
 OUT="$SCRIPT_DIR/out"
 : "${HARBOR_HOSTNAME:=harbor.kind.local}"
-[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run cluster/pki/create-ca.sh first" >&2; exit 1; }
+[[ -f "$PKI/issuing-ca.key" ]] || { echo "missing $PKI/issuing-ca.key - run pki/create-ca.sh first" >&2; exit 1; }
 
 mkdir -p "$OUT"
 umask 077
