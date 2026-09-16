@@ -7,19 +7,26 @@ A local multi-node Kubernetes cluster on [kind](https://kind.sigs.k8s.io/)
 - Istio as a second ingress path, turned on per namespace;
 - cert-manager with a local CA, plus trust-manager;
 - the External Secrets Operator (ESO) and Argo CD;
-- containerized k9s and lazydocker.
+- containerized k9s and lazydocker;
+- TopoLVM for node-local block storage, backed by LVM on the host;
+- Harbor as a local registry, in Docker Compose next to the cluster.
 
 Set up with [`update-setup-01.md`](update-setup-01.md), applied and verified on
-2026-09-15. It replaced the 2023 kind + MetalLB + Traefik setup (kept on git
+2026-09-15, and [`update-setup-02.md`](update-setup-02.md) (storage and
+registry), applied and verified on 2026-09-16. It replaced the 2023 kind + MetalLB + Traefik setup (kept on git
 history: commit `ada2a79`).
 
 ## Quick start
 
 ```bash
 cluster/pki/create-ca.sh      # once: local root CA + intermediates (cluster/pki/out/, git-ignored)
+sudo storage/setup-host.sh    # once: LVM volume group on a loop file + lvmd as a systemd unit
 cluster/cluster.sh up         # kind cluster, Gateway API CRDs, cloud-provider-kind
 ./deploy.sh                   # platform services, then test applications
-cluster/cluster.sh down       # delete the cluster (the PKI stays)
+cluster/cluster.sh down       # delete the cluster (the PKI and the LVM volume group stay)
+
+registry/setup-host.sh        # optional: Harbor (sudo only for its ./prepare step)
+registry/kind-trust.sh        # after every "cluster.sh up" if Harbor is used
 ```
 
 You need on `PATH`:
@@ -37,6 +44,7 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 .
 ├── versions.env          # cluster and CLI tool versions (platform services: in their kustomization.yaml)
 ├── deploy.sh             # platformservices/deploy.sh, then applications/deploy.sh
+├── hosts.sh              # *.kind.local Ingress hosts -> /etc/hosts (managed block)
 ├── cluster/              # kind binary (git-ignored), cluster-config.yaml, cluster.sh (up | down | cpk)
 │   └── pki/              # create-ca.sh; out/ holds the CA keys (git-ignored)
 ├── platformservices/     # one Kustomize tree; Helm charts via helmCharts
@@ -44,6 +52,8 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 │   ├── deploy.sh             # applies the parts in dependency order
 │   ├── cert-manager/  trust-manager/  istio/  external-secrets/  argocd/
 │   └── keda/                 # old 2.11.0 manifest, not deployed
+├── storage/              # host side of TopoLVM: loop device, volume group, lvmd systemd units
+├── registry/             # Harbor via Docker Compose; out/ is generated (git-ignored)
 ├── applications/         # one folder per test application, each with its own deploy.sh
 │   ├── deploy.sh             # deploys the default ones (testapp)
 │   ├── testapp/  testhelm/
@@ -94,8 +104,9 @@ sudo update-ca-certificates
 certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i cluster/pki/out/root-ca.crt  # Chrome/Chromium (libnss3-tools)
 # Firefox: Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import
 
-# 2. Host names -> Ingress IPs (check the current IPs with "kubectl get ingress -A")
-echo "$(kubectl -n argocd get ingress argocd-web -o jsonpath='{.status.loadBalancer.ingress[0].ip}') argocd.kind.local" | sudo tee -a /etc/hosts
+# 2. Host names -> Ingress IPs: all *.kind.local Ingress hosts into a managed block in /etc/hosts
+#    (sudo only if something changes; re-run after recreating the cluster)
+./hosts.sh               # --istio: prefer the Istio gateway IP, --dry-run, --remove
 ```
 
 Then open **https://argocd.kind.local**. The user is `admin`; the initial
@@ -109,9 +120,9 @@ Change it after the first login, then delete that Secret. Without root, use a
 port-forward instead: `kubectl -n argocd port-forward svc/argocd-server 8080:80`
 → http://localhost:8080.
 
-For the test apps, add `testapp.kind.local` and `testapp-mesh.kind.local` the same
-way. Note that the vanilla and Istio paths have different IPs, so a hosts entry
-picks one of them.
+`hosts.sh` also adds `testapp.kind.local` and `testapp-mesh.kind.local`. Each of
+them has a vanilla and an Istio Ingress with different IPs. The script uses the
+vanilla (cloud-provider-kind) IP unless you pass `--istio`.
 
 ## Cluster (`cluster/`)
 
@@ -359,6 +370,74 @@ gateway (B) or in the service (A).
 - **Rebuilding:** both images are built locally with checksum-verified binaries.
   Rebuild with `docker compose -f cli/compose.yaml build --pull`.
 
+## Storage (`storage/`, TopoLVM)
+
+Volumes are LVM logical volumes on the host, which suits Kafka/Strimzi and
+databases. `lvmd` runs on the host as a systemd unit; the kind nodes reach its
+socket and the LVM devices through `extraMounts` in `cluster/cluster-config.yaml`.
+
+```bash
+sudo storage/setup-host.sh          # once: lvm2, 60 GB loop file, volume group topolvm-vg, lvmd
+systemctl is-active lvmd.service    # active
+sudo vgs topolvm-vg                 # the volume group
+sudo lvs topolvm-vg                 # one logical volume per PVC
+sudo storage/teardown-host.sh       # removes it again (asks before deleting data)
+```
+
+| StorageClass | Use |
+| --- | --- |
+| `topolvm` (default) | LVM volumes on the node: databases, Kafka, anything that wants a local disk. Expansion works online |
+| `standard` | kind's local-path, kept as a fallback |
+
+Good to know:
+- **Volumes are node-local:** the class uses `WaitForFirstConsumer`, so the pod is
+  scheduled first and the volume is created on that node.
+- **Snapshots need a thin pool.** With plain (thick) LVs, TopoLVM can't snapshot.
+  `storage/lvmd.yaml` has a commented-out thin-pool device class for that.
+- **Logical volumes outlive the cluster.** Deleting the cluster leaves the LVs
+  behind, because the PVs go with it. Check with `sudo lvs topolvm-vg` and remove
+  with `sudo lvremove`.
+- **The backing file lives at `/var/lib/topolvm/backing.img`;** size it with
+  `sudo BACKING_SIZE=100G storage/setup-host.sh` before the first run.
+
+## Registry (`registry/`, Harbor)
+
+Harbor runs in Docker Compose on the host, so images survive
+`cluster/cluster.sh down`. Its TLS certificate comes from the local CA, so
+anything that trusts the root CA trusts Harbor.
+
+```bash
+registry/setup-host.sh              # certificate, installer, config, start (sudo only for ./prepare)
+registry/kind-trust.sh              # after every cluster.sh up: hosts entry, CA and containerd config in the nodes
+docker compose -f registry/out/harbor/docker-compose.yml ps     # runs as your user
+docker compose -f registry/out/harbor/docker-compose.yml stop   # when you need the memory
+```
+
+The admin password is in `registry/out/harbor/harbor.yml`
+(`harbor_admin_password`); the user is `admin`. Open https://harbor.kind.local
+after adding a hosts entry for the kind network gateway (see *Browser access*).
+
+Privileges, worth knowing:
+- **Only `prepare` needs root.** It runs a `--privileged` container with your
+  whole filesystem mounted at `/hostfs` and writes the configs and secrets as
+  root. It runs once, and again only when `harbor.yml` changes.
+- **Everything else runs as your user:** `up`, `stop`, `restart`, `ps`, `logs`.
+  After a `prepare`, the script re-adds group read on the four env files that
+  Compose itself reads; the file owners stay untouched, because Harbor's
+  processes read them as uid 10000.
+- **At runtime Harbor is unprivileged:** no container is privileged, and eight of
+  nine run as non-root users. Running the installation entirely without root is
+  an open upstream issue (goharbor/harbor#17494).
+
+To push from your own Docker (optional, needs root once):
+
+```bash
+sudo mkdir -p /etc/docker/certs.d/harbor.kind.local
+sudo cp cluster/pki/out/root-ca.crt /etc/docker/certs.d/harbor.kind.local/ca.crt
+echo "172.21.0.1 harbor.kind.local" | sudo tee -a /etc/hosts
+docker login harbor.kind.local
+```
+
 ## Known limitations
 
 [`update-setup-01.md`](update-setup-01.md) has the complete list. The main
@@ -371,7 +450,13 @@ points:
   API downgrade protection;
 - this host's inotify limits are low (`max_user_instances=128`); kind recommends
   512;
-- the intermediate CA keys live in cluster Secrets; there's no CRL/OCSP.
+- the intermediate CA keys live in cluster Secrets; there's no CRL/OCSP;
+- TopoLVM volumes are node-local, have no snapshots without a thin pool, and
+  their logical volumes stay on the host when the cluster is deleted;
+- the loop file sits on ZFS here, so it's copy-on-write on copy-on-write: fine
+  for dev, but not a performance reference;
+- Harbor's `prepare` is a privileged step (see above), and `registry/kind-trust.sh`
+  has to run after every cluster creation.
 
 ## Status of the 2023 suggestions
 
