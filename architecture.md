@@ -49,18 +49,24 @@ C4Container
     }
 
     System_Boundary(cluster, "kind cluster dev (Kubernetes 1.36)") {
-        Container(istio, "Istio", "istiod + ingress gateway", "Second ingress path and the service mesh; mTLS from the local root")
-        Container(certmgr, "cert-manager", "ClusterIssuer kind-ca", "Issues certificates for Ingresses and services")
-        Container(trustmgr, "trust-manager", "Bundle kind-root-ca", "Distributes the root certificate into every namespace")
-        Container(eso, "External Secrets Operator", "Cluster-wide", "Syncs external secret stores into Kubernetes Secrets")
-        Container(argocd, "Argo CD", "Upstream install, cluster-wide", "GitOps for all namespaces")
-        Container(topolvm, "TopoLVM", "CSI controller + node DaemonSet", "StorageClass topolvm; talks to lvmd on the host")
-        Container(apps, "Applications", "testapp, testapp-mesh, guestbook", "Test workloads, with and without the mesh")
+        Container_Boundary(platform, "Platform services (platformservices/)") {
+            Container(istio, "Istio", "istiod + ingress gateway", "Second ingress path and the service mesh; mTLS from the local root")
+            Container(certmgr, "cert-manager", "ClusterIssuer kind-ca", "Issues certificates for Ingresses and services")
+            Container(trustmgr, "trust-manager", "Bundle kind-root-ca", "Distributes the root certificate into every namespace")
+            Container(eso, "External Secrets Operator", "Cluster-wide", "Syncs external secret stores into Kubernetes Secrets")
+            Container(argocd, "Argo CD", "Upstream install, cluster-wide", "GitOps for all namespaces")
+            Container(topolvm, "TopoLVM", "CSI controller + node DaemonSet", "StorageClass topolvm; talks to lvmd on the host")
+        }
+        Container_Boundary(appspace, "Applications (applications/)") {
+            Container(apps, "Test workloads", "testapp, testapp-mesh", "The same app with and without a sidecar, each with two Ingresses")
+            Container(guestbook, "guestbook", "Deployed by Argo CD", "Proves the cluster-wide GitOps permissions")
+        }
     }
 
     Rel(dev, cli, "Operates", "terminal")
     Rel(dev, harbor, "Pushes images, uses the UI", "HTTPS")
     Rel(dev, envoys, "Reaches applications", "HTTP/HTTPS")
+    Rel(dev, argocd, "Declares applications, uses the UI", "Git and HTTPS via Ingress")
 
     Rel(cli, apps, "Manages workloads", "Kubernetes API over the kind network")
     Rel(cpk, envoys, "Creates and configures", "Docker API")
@@ -74,7 +80,7 @@ C4Container
     Rel(certmgr, pki, "Signs with the issuing CA", "Secret from cluster/pki")
     Rel(istio, pki, "Mesh certificates from the mesh CA", "Secret cacerts")
     Rel(trustmgr, apps, "Provides the root certificate", "ConfigMap per namespace")
-    Rel(argocd, apps, "Deploys", "Kubernetes API")
+    Rel(argocd, guestbook, "Deploys into any namespace", "Kubernetes API")
     Rel(apps, harbor, "Pulls images", "HTTPS via containerd, certs.d")
 ```
 
