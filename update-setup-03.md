@@ -89,7 +89,7 @@ KEYCLOAK_CONFIG_CLI_VERSION=6.5.1-26
 - **Realm as code with keycloak-config-cli**, not `--import-realm`. The import
   only ever *creates* a realm; config-cli applies changes to an existing realm,
   so the realm file in git stays the source of truth.
-- **Realm `platform`, not `master`.** `master` stays administrative.
+- **One realm `localdev`, not `master`.** It holds every identity in this setup - platform services, applications and workload clients - because a second realm would be a second issuer with its own user store, which ends SSO at the boundary. `master` stays administrative.
 - **Client secrets are generated once** into `identity/out/`, and injected into
   the realm file, Argo CD and Harbor from there. They never enter git.
 - **Local admin accounts stay** in Argo CD and Harbor as break-glass access, and
@@ -103,7 +103,7 @@ identity/
 ├── setup-host.sh           # certificate, secrets, start, realm apply
 ├── create-cert.sh          # server certificate for keycloak.kind.local from the local CA
 ├── realm/
-│   └── platform.yaml       # the realm as code (clients, groups, mappers, users)
+│   └── localdev.yaml       # the realm as code (clients, groups, mappers, users)
 └── out/                    # certificate, secrets, database volume (git-ignored)
 ```
 
@@ -223,17 +223,18 @@ to run after every `cluster/cluster.sh up`, like `registry/kind-trust.sh`, so
 
 ## Step 4: The realm as code
 
-`identity/realm/platform.yaml` is applied by keycloak-config-cli, which supports
+`identity/realm/localdev.yaml` is applied by keycloak-config-cli, which supports
 variable substitution, so secrets stay out of git:
 
 ```yaml
-realm: platform
-displayName: kind-dev platform
+realm: localdev
+displayName: kind-dev local development
 enabled: true
 
-groups:
-  - name: platform-admins
+groups:                    # the names say what the rights are for, not what the realm is
+  - name: platform-admins  # admin on the platform services (Argo CD, Harbor)
   - name: platform-users
+  # applications add their own as they arrive, e.g. app-<name>-admins
 
 clientScopes:
   - name: groups
@@ -327,7 +328,7 @@ existing `argocd-cmd-params-cm` patch:
       url: https://argocd.kind.local
       oidc.config: |
         name: Keycloak
-        issuer: https://keycloak.kind.local:8443/realms/platform
+        issuer: https://keycloak.kind.local:8443/realms/localdev
         clientID: argocd
         clientSecret: $oidc.keycloak.clientSecret
         cliClientID: argocd
@@ -370,7 +371,7 @@ curl -u "admin:$HARBOR_ADMIN_PASSWORD" -X PUT \
   -H 'Content-Type: application/json' -d '{
     "auth_mode": "oidc_auth",
     "oidc_name": "Keycloak",
-    "oidc_endpoint": "https://keycloak.kind.local:8443/realms/platform",
+    "oidc_endpoint": "https://keycloak.kind.local:8443/realms/localdev",
     "oidc_client_id": "harbor",
     "oidc_client_secret": "<identity/out/harbor-secret>",
     "oidc_scope": "openid,profile,email,groups,offline_access",
@@ -404,12 +405,12 @@ from the user profile, not the Keycloak password.
 
 ```bash
 # Keycloak reachable, issuer correct
-curl -s --cacert pki/out/root-ca.crt https://keycloak.kind.local:8443/realms/platform/.well-known/openid-configuration \
+curl -s --cacert pki/out/root-ca.crt https://keycloak.kind.local:8443/realms/localdev/.well-known/openid-configuration \
   | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["issuer"]); print(d["authorization_endpoint"])'
 
 # Reachable from inside the cluster (CoreDNS + certificate)
 kubectl -n argocd exec deploy/argocd-server -- \
-  curl -s https://keycloak.kind.local:8443/realms/platform | head -c 120
+  curl -s https://keycloak.kind.local:8443/realms/localdev | head -c 120
 
 # Argo CD: browser login via Keycloak, then
 argocd login argocd.kind.local --sso --grpc-web
@@ -420,7 +421,7 @@ curl -s -u "admin:$PW" --cacert pki/out/root-ca.crt --resolve harbor.kind.local:
   https://harbor.kind.local:3443/api/v2.0/configurations | grep -o '"auth_mode":{[^}]*}'
 ```
 
-Expected: the issuer is `https://keycloak.kind.local:8443/realms/platform` in
+Expected: the issuer is `https://keycloak.kind.local:8443/realms/localdev` in
 both directions, the Argo CD user `dev` is admin through `platform-admins` while
 users without the group are read-only, and Harbor accepts the same login.
 
@@ -442,9 +443,11 @@ users without the group are read-only, and Harbor accepts the same login.
 Context: every platform service brought its own login (Argo CD admin, Harbor
 admin), which doesn't scale and doesn't resemble production. An IdP inside the
 dev cluster would disappear with the cluster, while everything else depends on
-it. Decision: Keycloak in Docker Compose on the host, realm `platform` as code,
-Argo CD and Harbor as OIDC clients, permissions through the group
-`platform-admins`. Consequences: one login for the platform, identity survives
+it. Decision: Keycloak in Docker Compose on the host, with a single realm
+`localdev` as code - named after the environment, because it holds application
+and workload identities as well as the platform ones. Argo CD and Harbor are the
+first OIDC clients, and permissions come from the group `platform-admins`.
+Consequences: one login for the platform, identity survives
 cluster rebuilds, and new services are one client each; but Keycloak becomes a
 critical dependency (hence local break-glass accounts), it occupies port 8443
 because 80/443 are reserved for the cluster ingress and Harbor sits on 3030/3443,
