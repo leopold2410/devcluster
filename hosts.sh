@@ -53,7 +53,13 @@ if ! $remove; then
     # reaches it on the loopback address. Only once it is set up, so a setup without
     # identity/ gets no entry for it. (The pods use CoreDNS instead: identity/cluster-dns.sh.)
     if [[ -d "$SCRIPT_DIR/identity/out" ]]; then
-        entries+=$'\n'"127.0.0.1 ${KEYCLOAK_HOSTNAME:-keycloak.kind.local}"
+        # The kind bridge gateway, not 127.0.0.1: Docker's embedded DNS forwards to the host
+        # resolver, which reads this file, so containers see this entry too - and their own
+        # loopback is not the host's (Harbor's core would fail to reach the issuer).
+        # Keycloak publishes on 127.0.0.1 and on the gateway, so the gateway serves everyone.
+        kc_ip=$(docker network inspect kind -f '{{range .IPAM.Config}}{{if .Gateway}}{{.Gateway}} {{end}}{{end}}' 2>/dev/null |
+            tr ' ' '\n' | grep -v ':' | head -1)
+        entries+=$'\n'"${kc_ip:-127.0.0.1} ${KEYCLOAK_HOSTNAME:-keycloak.kind.local}"
     fi
 
     while read -r ip host; do

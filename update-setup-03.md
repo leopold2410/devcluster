@@ -492,10 +492,26 @@ these points, all found while applying:
 - **`identity/cluster-dns.sh` edits the CoreDNS Corefile** and inserts a `hosts`
   block before the `kubernetes` plugin, then restarts CoreDNS.
 - **`./hosts.sh` adds the host entry**, instead of the manual line the plan asked
-  for. It emits `127.0.0.1 keycloak.kind.local` into its managed block as soon as
+  for. It emits `keycloak.kind.local` into its managed block as soon as
   `identity/out/` exists, so the browser side needs no separate step. The block
   markers stayed as they were, so existing blocks are still recognised and
   replaced.
+- **That entry points at the kind bridge gateway, not at `127.0.0.1`.** Docker's
+  embedded DNS forwards to the host resolver, which reads `/etc/hosts`, so the
+  line leaks into every container — and a container's loopback is not the host's.
+  With `127.0.0.1` there, Harbor's core failed with
+  `dial tcp 127.0.0.1:8443: connect: connection refused` while fetching the
+  discovery document. Keycloak publishes on `127.0.0.1:8443` and on
+  `172.21.0.1:8443`, so the gateway address serves the browser, Harbor and the
+  pods alike. Argo CD never saw the problem because it resolves through CoreDNS.
+- **Restart Harbor's `proxy` along with `core` and `jobservice`.** nginx resolves
+  its upstreams once at startup, so restarting only the two left it pointing at
+  their previous container addresses; every API call then landed on the wrong
+  service and returned
+  `401 'Authorization' should start with 'Harbor-Secret'`. Note the service is
+  `proxy` while the container is named `nginx`.
+- **`registry/oidc-setup.sh` waits for Harbor** after such a restart: nginx
+  answers 502 until core is serving, which otherwise breaks the first API call.
 - **Harbor's trust step needs sudo.** `./prepare` creates
   `common/config/shared/trust-certificates/` as root, so copying the root CA in
   is the one privileged action; `registry/oidc-setup.sh` refuses with the exact

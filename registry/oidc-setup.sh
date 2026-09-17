@@ -34,14 +34,38 @@ if [[ ! -f "$TRUST/kind-dev-root-ca.crt" ]]; then
 Harbor does not trust the local root CA yet. That is one root-owned copy:
 
   sudo cp $PKI/root-ca.crt $TRUST/kind-dev-root-ca.crt
-  docker compose -f $COMPOSE restart core jobservice
+  docker compose -f $COMPOSE restart core jobservice proxy
 
 Then run this script again.
 EOF
     exit 1
 fi
 
-# 2. auth_mode can only be changed while no normal user exists besides admin.
+# 2. After a restart, nginx answers 502 until core is serving again. Wait for it,
+# otherwise the first API call gets HTML instead of JSON.
+echo -n "waiting for Harbor"
+for i in $(seq 1 40); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$PW" --cacert "$PKI/root-ca.crt" \
+        --resolve "$HARBOR_HOSTNAME:$HARBOR_HTTPS_PORT:127.0.0.1" \
+        "$HARBOR_URL/api/v2.0/ping" || true)
+    [[ $code == 200 ]] && { echo " ok"; break; }
+    # 401 means core is serving and only the credentials are wrong - waiting will not help.
+    if [[ $code == 401 ]]; then
+        echo
+        echo "Harbor rejected the admin credentials from $SCRIPT_DIR/out/harbor/harbor.yml." >&2
+        exit 1
+    fi
+    echo -n .
+    sleep 3
+    if [[ $i == 40 ]]; then
+        echo
+        echo "Harbor is not answering on $HARBOR_URL (last HTTP $code)." >&2
+        echo "Check: docker compose -f $COMPOSE ps" >&2
+        exit 1
+    fi
+done
+
+# 3. auth_mode can only be changed while no normal user exists besides admin.
 users=$(curl_harbor "$HARBOR_URL/api/v2.0/users" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))')
 mode=$(curl_harbor "$HARBOR_URL/api/v2.0/configurations" | python3 -c 'import sys,json; print(json.load(sys.stdin)["auth_mode"]["value"])')
 if [[ $mode != oidc_auth && $users -gt 0 ]]; then

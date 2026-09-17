@@ -466,8 +466,12 @@ docker compose -f identity/compose.yaml stop     # when you need the memory
 ```
 
 The browser has to resolve the name too, which `./hosts.sh` takes care of: it
-adds `127.0.0.1 keycloak.kind.local` to its managed block once `identity/out/`
-exists, alongside the Ingress hosts.
+adds `keycloak.kind.local` to its managed block once `identity/out/` exists,
+alongside the Ingress hosts. The entry points at the **kind bridge gateway**
+(`172.21.0.1`), not at `127.0.0.1`: Docker's embedded DNS forwards to the host
+resolver, so `/etc/hosts` is what Harbor's containers see as well, and their own
+loopback is not the host's. Keycloak publishes on both addresses, so the gateway
+address works for the browser, for Harbor and for the pods alike.
 
 - **URL** https://keycloak.kind.local:8443, realm **`localdev`**, admin `admin`.
   The passwords are generated into `identity/out/` (`admin-password`,
@@ -496,7 +500,10 @@ Harbor's custom certificate directory first, which `./prepare` created as root:
 ```bash
 sudo cp pki/out/root-ca.crt \
   registry/out/harbor/common/config/shared/trust-certificates/kind-dev-root-ca.crt
-docker compose -f registry/out/harbor/docker-compose.yml restart core jobservice
+# proxy as well: nginx resolves its upstreams once at startup, so restarting only core
+# and jobservice leaves it pointing at their previous container addresses (API calls
+# then land on the wrong service and fail with "should start with 'Harbor-Secret'")
+docker compose -f registry/out/harbor/docker-compose.yml restart core jobservice proxy
 registry/oidc-setup.sh
 ```
 
