@@ -1,0 +1,54 @@
+# Keycloak as the central identity provider (update-setup-03).
+# Runs outside the cluster, like Harbor: it exists before the cluster, survives
+# "cluster/cluster.sh down" and keeps working when the cluster is gone.
+#
+# Variables come from ./.env, which identity/setup-host.sh generates from ../versions.env
+# plus the secrets it creates in ./out/. Run the script; "docker compose ps|logs|stop"
+# work on their own afterwards.
+name: identity
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-17-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run identity/setup-host.sh first}
+    volumes:
+      - ./out/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:${KEYCLOAK_VERSION:?set in ../versions.env}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Not "start --optimized": that needs a kc.sh build baked into the image.
+    # The build runs at startup instead (see update-setup-03, step 1).
+    command: ["start"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?run identity/setup-host.sh first}
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?run identity/setup-host.sh first}
+      # The hostname carries the port, because it ends up in the issuer URL and in
+      # every redirect: 80/443 are reserved for the cluster ingress, Harbor holds 3030/3443.
+      KC_HOSTNAME: https://${KEYCLOAK_HOSTNAME}:${KEYCLOAK_HTTPS_PORT}
+      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/conf/tls/tls.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/conf/tls/tls.key
+      KC_HTTPS_PORT: ${KEYCLOAK_HTTPS_PORT}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./out/tls:/opt/keycloak/conf/tls:ro
+    ports:
+      # 127.0.0.1 for the browser on this host, the kind bridge gateway for the pods.
+      - "127.0.0.1:${KEYCLOAK_HTTPS_PORT}:${KEYCLOAK_HTTPS_PORT}"
+      - "172.21.0.1:${KEYCLOAK_HTTPS_PORT}:${KEYCLOAK_HTTPS_PORT}"

@@ -45,6 +45,7 @@ C4Container
         Container(lvmd, "lvmd", "systemd unit, gRPC over a Unix socket", "Creates and resizes LVM volumes for TopoLVM")
         ContainerDb(vg, "Volume group topolvm-vg", "LVM on a loop-backed file", "Backing store of all node volumes")
         Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA")
+        Container(keycloak, "Keycloak", "Docker Compose: keycloak + PostgreSQL, port 8443", "Central identity provider standing in for a company IdP; realm localdev as code")
         ContainerDb(pki, "Local PKI", "OpenSSL files in pki/out", "Root CA plus intermediates for cert-manager, the Istio mesh and the host-side services")
     }
 
@@ -82,6 +83,11 @@ C4Container
     Rel(trustmgr, apps, "Provides the root certificate", "ConfigMap per namespace")
     Rel(argocd, guestbook, "Deploys into any namespace", "Kubernetes API")
     Rel(apps, harbor, "Pulls images", "HTTPS via containerd, certs.d")
+
+    Rel(dev, keycloak, "Logs in once for the platform", "HTTPS, browser")
+    Rel(argocd, keycloak, "OIDC discovery and token validation", "HTTPS via CoreDNS to the kind gateway")
+    Rel(harbor, keycloak, "Authenticates users, groups decide admin rights", "OIDC")
+    Rel(keycloak, pki, "Server certificate from the issuing CA", "files in identity/out/tls")
 ```
 
 ## Storage
@@ -433,3 +439,34 @@ are deliberately not provided; if needed, JuiceFS or Ceph would be the next step
 **Consequences.** Simple and cheap, matching Strimzi's recommendation. No RWX and
 no data outliving a cluster rebuild at the Kubernetes level: logical volumes stay
 on the host, but their PVs don't.
+
+## ADR-0017: Keycloak outside the cluster as the central identity provider
+
+**Date:** 2026-09-17 · **Status:** Accepted
+
+**Context.** Every platform service brought its own login: Argo CD's local admin,
+Harbor's admin. That gives no per-person identity, does not scale past one
+person, and does not resemble production. An identity provider *inside* the dev
+cluster would disappear with every rebuild, while everything else depends on it —
+a company IdP behaves the other way round: it is there, and systems register with
+it.
+
+**Decision.** Keycloak 26.7.3 with PostgreSQL in Docker Compose on the host, on
+port 8443, because 80/443 stay reserved for the cluster ingress and Harbor holds
+3030/3443. One realm, `localdev`, applied from `identity/realm/localdev.yaml` by
+keycloak-config-cli, which updates an existing realm instead of only creating
+one — so the realm is code rather than state on the host. Argo CD and Harbor are
+the first clients, authorization comes from the `groups` claim
+(`platform-admins`), and the server certificate is issued by the local issuing
+CA, so clients verify it against the same root as everything else. Local admin
+accounts stay as break-glass.
+
+**Consequences.** One login for the platform, identity survives cluster rebuilds,
+and each further service is one client plus its own OIDC settings. Argo CD
+verifies the issuer through `rootCA` instead of skipping verification, and pods
+resolve the issuer through a CoreDNS hosts entry that `identity/cluster-dns.sh`
+re-applies after every cluster creation. Against that: logging in now depends on
+Keycloak running, the port appears in the issuer URL and in every redirect URI,
+Harbor's trust step needs one root-owned copy of the root CA, and the in-cluster
+operator path is not practised. Secrets (client secrets, admin and user
+passwords) live in `identity/out/`, outside git.

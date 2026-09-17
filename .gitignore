@@ -6,3 +6,6 @@
 charts/
 # Harbor installer, certificates and data
 /registry/out/
+# Keycloak certificates, secrets, database; .env holds generated passwords
+/identity/out/
+/identity/.env

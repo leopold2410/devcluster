@@ -27,6 +27,9 @@ cluster/cluster.sh down       # delete the cluster (the PKI and the LVM volume g
 
 registry/setup-host.sh        # optional: Harbor (sudo only for its ./prepare step)
 registry/kind-trust.sh        # after every "cluster.sh up" if Harbor is used
+
+identity/setup-host.sh        # optional: Keycloak (no root; one /etc/hosts line is yours)
+identity/cluster-dns.sh       # after every "cluster.sh up" if Keycloak is used
 ```
 
 You need on `PATH`:
@@ -55,6 +58,7 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 │   └── keda/                 # old 2.11.0 manifest, not deployed
 ├── storage/              # host side of TopoLVM: loop device, volume group, lvmd systemd units
 ├── registry/             # Harbor via Docker Compose; out/ is generated (git-ignored)
+├── identity/             # Keycloak via Docker Compose; the realm is code in realm/localdev.yaml
 ├── applications/         # one folder per test application, each with its own deploy.sh
 │   ├── deploy.sh             # deploys the default ones (testapp)
 │   ├── testapp/  testhelm/
@@ -447,6 +451,67 @@ sudo cp pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
 echo "172.21.0.1 harbor.kind.local" | sudo tee -a /etc/hosts
 docker login harbor.kind.local:3443
 ```
+
+## Identity (`identity/`, Keycloak)
+
+Keycloak stands in for a company-wide identity provider: it runs on the host, so
+it exists before the cluster and survives `cluster/cluster.sh down`. Argo CD and
+Harbor are its clients, so one login covers the platform.
+
+```bash
+identity/setup-host.sh              # certificate, secrets, containers, realm (no root)
+identity/cluster-dns.sh             # after every cluster.sh up: CoreDNS entry for the pods
+docker compose -f identity/compose.yaml ps
+docker compose -f identity/compose.yaml stop     # when you need the memory
+```
+
+One line in `/etc/hosts` is yours to add, because the browser resolves the name
+too (`hosts.sh` only manages Ingress hosts):
+
+```bash
+echo "127.0.0.1 keycloak.kind.local" | sudo tee -a /etc/hosts
+```
+
+- **URL** https://keycloak.kind.local:8443, realm **`localdev`**, admin `admin`.
+  The passwords are generated into `identity/out/` (`admin-password`,
+  `dev-password`); the realm ships one user, `dev`, in `platform-admins`.
+- **The realm is code.** `identity/realm/localdev.yaml` is applied by
+  keycloak-config-cli, which *updates* an existing realm, so re-running
+  `setup-host.sh` is safe and the file stays the source of truth. Client secrets
+  are substituted from `identity/out/` with `$(env:NAME)` and never enter git.
+- **Certificate from the local CA,** like Harbor's, so anything that trusts the
+  root CA trusts Keycloak. Argo CD verifies it through `rootCA` in `oidc.config`
+  rather than skipping verification.
+- **Pods reach it** through a CoreDNS `hosts` entry pointing at the kind bridge
+  gateway; `identity/cluster-dns.sh` writes it after every cluster creation.
+- **Port 8443** because 80/443 stay reserved for the cluster ingress and Harbor
+  holds 3030/3443. The port is part of the issuer URL and of every redirect URI.
+
+**Argo CD** is wired up by `platformservices/deploy.sh` whenever
+`identity/out/` exists: it patches the client secret into `argocd-secret` and
+`oidc.config` into `argocd-cm`. Permissions come from the group claim —
+`platform-admins` get `role:admin`, everyone else `role:readonly`. The local
+`admin` account stays as break-glass.
+
+**Harbor** is switched over by `registry/oidc-setup.sh`. It needs the root CA in
+Harbor's custom certificate directory first, which `./prepare` created as root:
+
+```bash
+sudo cp pki/out/root-ca.crt \
+  registry/out/harbor/common/config/shared/trust-certificates/kind-dev-root-ca.crt
+docker compose -f registry/out/harbor/docker-compose.yml restart core jobservice
+registry/oidc-setup.sh
+```
+
+Members of `platform-admins` become Harbor administrators, users are onboarded
+on first login, and the local admin stays reachable at
+`/account/sign-in?always_sso_login=false`. Note that OIDC users need the **CLI
+secret** from their Harbor profile for `docker login`, not their Keycloak
+password.
+
+**Adding a service** is one client in `identity/realm/localdev.yaml` plus that
+service's own OIDC settings — the realm holds platform, application and workload
+identities alike.
 
 ## Known limitations
 

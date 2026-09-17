@@ -1,0 +1,77 @@
+# The localdev realm as code (update-setup-03), applied by keycloak-config-cli.
+# One realm for everything in this setup: platform services, applications and workload
+# clients. A second realm would be a second issuer with its own user store, which ends
+# SSO at the boundary. Secrets are substituted from the environment by config-cli, so none is in git.
+realm: localdev
+displayName: kind-dev local development
+enabled: true
+loginWithEmailAllowed: true
+registrationAllowed: false
+
+groups:                    # the names say what the rights are for, not what the realm is
+  - name: platform-admins  # admin on the platform services (Argo CD, Harbor)
+  - name: platform-users
+  # applications add their own as they arrive, e.g. app-<name>-admins
+
+clientScopes:
+  # Argo CD and Harbor both authorize by group, so the claim has to be in the token.
+  - name: groups
+    protocol: openid-connect
+    description: Group membership of the user
+    attributes:
+      include.in.token.scope: "true"
+      display.on.consent.screen: "false"
+    protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: "false"        # "platform-admins", not "/platform-admins"
+          id.token.claim: "true"
+          access.token.claim: "true"
+          userinfo.token.claim: "true"
+
+clients:
+  - clientId: argocd
+    name: Argo CD
+    enabled: true
+    publicClient: false
+    standardFlowEnabled: true
+    directAccessGrantsEnabled: false
+    secret: $(env:ARGOCD_CLIENT_SECRET)
+    rootUrl: https://argocd.kind.local
+    redirectUris:
+      - https://argocd.kind.local/auth/callback
+      - http://localhost:8085/auth/callback      # argocd CLI, "argocd login --sso"
+    webOrigins:
+      - https://argocd.kind.local
+    defaultClientScopes: [openid, profile, email, roles, web-origins, groups]
+
+  - clientId: harbor
+    name: Harbor
+    enabled: true
+    publicClient: false
+    standardFlowEnabled: true
+    directAccessGrantsEnabled: false
+    secret: $(env:HARBOR_CLIENT_SECRET)
+    rootUrl: https://harbor.kind.local:3443
+    redirectUris:
+      - https://harbor.kind.local:3443/c/oidc/callback   # Harbor's OIDCCallbackPath
+    webOrigins:
+      - https://harbor.kind.local:3443
+    defaultClientScopes: [openid, profile, email, roles, web-origins, groups]
+
+users:
+  - username: dev
+    enabled: true
+    email: dev@kind.local
+    emailVerified: true
+    firstName: Dev
+    lastName: User
+    groups:
+      - platform-admins
+    credentials:
+      - type: password
+        value: $(env:DEV_USER_PASSWORD)
+        temporary: false        # not a temporary password: this account is used by scripts too

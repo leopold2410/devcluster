@@ -54,3 +54,36 @@ apply external-secrets;     available external-secrets
 # 4. Argo CD: one instance for the whole cluster
 apply argocd;               available argocd
 kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+
+# 5. Keycloak as Argo CD's identity provider (update-setup-03), when identity/ is set up.
+# Not part of the Kustomize render: the client secret lives in identity/out/ and the root CA
+# in pki/out/, neither of which is in git.
+IDENTITY="$SCRIPT_DIR/../identity/out"
+if [[ -f "$IDENTITY/argocd-client-secret" ]]; then
+    echo "--- argocd: Keycloak OIDC"
+    source "$SCRIPT_DIR/../versions.env"
+    kubectl -n argocd patch secret argocd-secret --type merge \
+        -p "{\"stringData\":{\"oidc.keycloak.clientSecret\":\"$(cat "$IDENTITY/argocd-client-secret")\"}}" >/dev/null
+    # rootCA lets Argo CD verify the issuer against the local root, instead of skipping verification
+    patch=$(CA="$(cat "$PKI/root-ca.crt")" \
+            ISSUER="https://${KEYCLOAK_HOSTNAME}:${KEYCLOAK_HTTPS_PORT}/realms/${KEYCLOAK_REALM}" \
+            python3 -c '
+import json, os
+ca = "\n".join("  " + line for line in os.environ["CA"].splitlines())
+issuer = os.environ["ISSUER"]
+oidc = (
+    "name: Keycloak\n"
+    "issuer: " + issuer + "\n"
+    "clientID: argocd\n"
+    "clientSecret: $oidc.keycloak.clientSecret\n"
+    "cliClientID: argocd\n"
+    "requestedScopes: [\"openid\", \"profile\", \"email\", \"groups\"]\n"
+    "rootCA: |\n" + ca + "\n"
+)
+print(json.dumps({"data": {"url": "https://argocd.kind.local", "oidc.config": oidc}}))')
+    kubectl -n argocd patch configmap argocd-cm --type merge -p "$patch" >/dev/null
+    kubectl -n argocd rollout restart deployment/argocd-server
+    kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
+else
+    echo "--- argocd: identity/out/argocd-client-secret missing, skipping the Keycloak wiring"
+fi

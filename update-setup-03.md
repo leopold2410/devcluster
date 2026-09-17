@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-16 |
-| Status | **Planned, not yet applied** |
+| Status | **Applied on 2026-09-17.** Keycloak 26.7.3 runs with PostgreSQL on the host, realm `localdev` is applied from code, and Argo CD logs in through it (verified: the server initialises the OIDC provider against the issuer, `/auth/login` redirects to the realm, and an example ID token carries `groups: [platform-admins]`). Harbor's switch is scripted in `registry/oidc-setup.sh` and waits for one root-owned copy of the root CA. See *Implementation notes* |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) and [`update-setup-02.md`](update-setup-02.md) |
 
 ## Goals
@@ -462,6 +462,56 @@ practised.
 | **Applications behind the vanilla Ingress** | oauth2-proxy in front of the app | cloud-provider-kind has no auth of its own |
 | **Kubernetes API** | `oidc-issuer-url` and friends as `kubeadmConfigPatches` | Requires recreating the cluster; kubectl then logs in through Keycloak |
 | **Other UIs** (Grafana, …) | Standard OIDC clients in the realm file | Same pattern as Argo CD |
+
+## Implementation notes
+
+The files in `identity/` are authoritative; they differ from the drafts above in
+these points, all found while applying:
+
+- **`$(env:NAME)`, not `$(env NAME)`.** keycloak-config-cli resolves variables
+  through a lookup prefix, so the colon is required. The first run failed with
+  `Cannot resolve variable 'env VAR'` — and the variable it could not resolve
+  came from the *comment* in the realm file, which substitution reads as well.
+  Substitution also needs `IMPORT_VARSUBSTITUTION_ENABLED=true`.
+- **`start`, not `start --optimized`.** The stock image has no `kc.sh build`
+  baked in, so the build happens at startup. Option 1 of step 1, as planned.
+- **Secrets reach Compose through a generated `identity/.env`** (mode 600,
+  git-ignored) rather than Docker secrets and `_FILE` variables, so
+  `docker compose ps|logs|stop` work without the script and no `_FILE` support
+  has to be assumed.
+- **Keycloak is published on two addresses:** `127.0.0.1:8443` for the browser
+  and `172.21.0.1:8443` for the pods, instead of one host-wide binding.
+- **`KEYCLOAK_SSLVERIFY=false` for the config-cli call only.** It talks to the
+  container's own name inside the Compose network, which the certificate
+  (`keycloak.kind.local`) does not cover.
+- **Argo CD's `oidc.config` is patched by `platformservices/deploy.sh`,** not
+  rendered by Kustomize: it carries the root CA and the client secret, which live
+  outside git. Kustomize keeps the static half (`argocd-rbac-cm`). The block is
+  skipped when `identity/out/` is absent, so the cluster still deploys without
+  Keycloak.
+- **`identity/cluster-dns.sh` edits the CoreDNS Corefile** and inserts a `hosts`
+  block before the `kubernetes` plugin, then restarts CoreDNS.
+- **Harbor's trust step needs sudo.** `./prepare` creates
+  `common/config/shared/trust-certificates/` as root, so copying the root CA in
+  is the one privileged action; `registry/oidc-setup.sh` refuses with the exact
+  two commands rather than doing it silently.
+- **Getting an admin token with curl needs `--data-urlencode`.** The generated
+  passwords contain `+`, which is a space in form encoding — the cause of a
+  confusing `invalid_grant` while verifying.
+- **The realm is `localdev`,** renamed before implementation because it holds
+  application and workload identities too, not only the platform ones.
+
+Verification evidence (2026-09-17):
+
+```
+argocd-server: Initializing OIDC provider (issuer: https://keycloak.kind.local:8443/realms/localdev)
+GET /auth/login -> 303 https://keycloak.kind.local:8443/realms/localdev/protocol/openid-connect/auth
+                   ?client_id=argocd&redirect_uri=https%3A%2F%2Fargocd.kind.local%2Fauth%2Fcallback
+                   &response_type=code&scope=openid+profile+email+groups
+example id token: {'iss': '.../realms/localdev', 'aud': 'argocd',
+                   'preferred_username': 'dev', 'groups': ['platform-admins']}
+in-cluster: keycloak.kind.local -> 172.21.0.1, port 8443 reachable from a pod
+```
 
 ## Known limitations and open points
 

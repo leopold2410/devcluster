@@ -16,3 +16,18 @@ patches:
       name: argocd-cmd-params-cm
     data:
       server.insecure: "true"
+# Permissions come from the Keycloak groups claim (update-setup-03). Everyone who
+# authenticates may read; platform-admins administer. The local admin account stays
+# as break-glass until the OIDC login is proven.
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: argocd-rbac-cm
+    data:
+      policy.default: role:readonly
+      policy.csv: |
+        g, platform-admins, role:admin
+# oidc.config is NOT here: it carries the client secret reference and the root CA,
+# which live outside git (identity/out, pki/out). platformservices/deploy.sh patches
+# argocd-cm and argocd-secret with them after this part is applied.
