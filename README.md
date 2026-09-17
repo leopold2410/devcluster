@@ -465,12 +465,9 @@ docker compose -f identity/compose.yaml ps
 docker compose -f identity/compose.yaml stop     # when you need the memory
 ```
 
-One line in `/etc/hosts` is yours to add, because the browser resolves the name
-too (`hosts.sh` only manages Ingress hosts):
-
-```bash
-echo "127.0.0.1 keycloak.kind.local" | sudo tee -a /etc/hosts
-```
+The browser has to resolve the name too, which `./hosts.sh` takes care of: it
+adds `127.0.0.1 keycloak.kind.local` to its managed block once `identity/out/`
+exists, alongside the Ingress hosts.
 
 - **URL** https://keycloak.kind.local:8443, realm **`localdev`**, admin `admin`.
   The passwords are generated into `identity/out/` (`admin-password`,

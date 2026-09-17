@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Add the kind cluster's Ingress host names (*.kind.local) to /etc/hosts.
+# Add the kind cluster's Ingress host names (*.kind.local) to /etc/hosts, plus the
+# host-side services that are not Ingresses (Keycloak).
 # The entries live in a marked block that is rewritten on every run, so changed
 # LoadBalancer IPs (e.g. after recreating the cluster) are picked up. Uses sudo only
 # when the file actually changes. Entries outside the block are never touched.
@@ -47,6 +48,13 @@ if ! $remove; then
                 for (h in pending) if (!(h in ip)) print "note: " h " has no LoadBalancer IP yet" > "/dev/stderr"
                 for (h in ip) print ip[h], h
             }' | sort -k2)
+
+    # Keycloak is not an Ingress: it runs in Docker Compose on this host, so the browser
+    # reaches it on the loopback address. Only once it is set up, so a setup without
+    # identity/ gets no entry for it. (The pods use CoreDNS instead: identity/cluster-dns.sh.)
+    if [[ -d "$SCRIPT_DIR/identity/out" ]]; then
+        entries+=$'\n'"127.0.0.1 ${KEYCLOAK_HOSTNAME:-keycloak.kind.local}"
+    fi
 
     while read -r ip host; do
         [[ -n $host ]] || continue

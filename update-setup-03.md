@@ -491,6 +491,11 @@ these points, all found while applying:
   Keycloak.
 - **`identity/cluster-dns.sh` edits the CoreDNS Corefile** and inserts a `hosts`
   block before the `kubernetes` plugin, then restarts CoreDNS.
+- **`./hosts.sh` adds the host entry**, instead of the manual line the plan asked
+  for. It emits `127.0.0.1 keycloak.kind.local` into its managed block as soon as
+  `identity/out/` exists, so the browser side needs no separate step. The block
+  markers stayed as they were, so existing blocks are still recognised and
+  replaced.
 - **Harbor's trust step needs sudo.** `./prepare` creates
   `common/config/shared/trust-certificates/` as root, so copying the root CA in
   is the one privileged action; `registry/oidc-setup.sh` refuses with the exact
