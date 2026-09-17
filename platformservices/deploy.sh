@@ -62,6 +62,8 @@ IDENTITY="$SCRIPT_DIR/../identity/out"
 if [[ -f "$IDENTITY/argocd-client-secret" ]]; then
     echo "--- argocd: Keycloak OIDC"
     source "$SCRIPT_DIR/../versions.env"
+    # The external provider as a cluster object: keycloak.identity.svc.cluster.local
+    apply identity
     kubectl -n argocd patch secret argocd-secret --type merge \
         -p "{\"stringData\":{\"oidc.keycloak.clientSecret\":\"$(cat "$IDENTITY/argocd-client-secret")\"}}" >/dev/null
     # rootCA lets Argo CD verify the issuer against the local root, instead of skipping verification

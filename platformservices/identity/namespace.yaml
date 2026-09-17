@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: identity
+  labels:
+    # No workloads run here: the namespace exists to give the external identity
+    # provider a place in the cluster's own naming (update-setup-03).
+    kubernetes.io/metadata.name: identity

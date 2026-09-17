@@ -1,0 +1,25 @@
+# Keycloak runs on the host, in Docker Compose, not in this cluster. This Service makes
+# that boundary explicit and gives the external provider a cluster-internal name:
+#
+#   keycloak.identity.svc.cluster.local  ->  CNAME  ->  keycloak.kind.local  ->  172.21.0.1
+#
+# The second hop is the hosts block that identity/cluster-dns.sh puts into CoreDNS; the
+# address is the kind bridge gateway, which is the host as the cluster sees it.
+#
+# Use it to discover and to reach Keycloak - but not as the OIDC URL. An OIDC client has
+# to call the issuer's own hostname: the token's "iss" must match what the client asked
+# for, and Keycloak's certificate only carries DNS:keycloak.kind.local. Argo CD therefore
+# keeps the issuer https://keycloak.kind.local:8443/realms/localdev.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: identity
+spec:
+  type: ExternalName
+  externalName: keycloak.kind.local
+  ports:
+    # Informational: an ExternalName Service does no port mapping, it only answers DNS.
+    - name: https
+      port: 8443
+      protocol: TCP

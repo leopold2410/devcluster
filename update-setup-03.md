@@ -512,6 +512,19 @@ these points, all found while applying:
   `proxy` while the container is named `nginx`.
 - **`registry/oidc-setup.sh` waits for Harbor** after such a restart: nginx
   answers 502 until core is serving, which otherwise breaks the first API call.
+- **The external provider has a cluster object** (`platformservices/identity/`):
+  a namespace plus an ExternalName Service, so
+  `keycloak.identity.svc.cluster.local` resolves to `keycloak.kind.local` and the
+  boundary is visible from inside the cluster. It is an alias for discovery and
+  reachability, not an OIDC URL: the issuer hostname has to be the one the client
+  calls, because `iss` must match the request and the certificate only carries
+  `DNS:keycloak.kind.local`.
+- **`host.local` was considered and rejected.** A name outside the root CA's
+  permitted subtrees (`kind.local`, `svc`, `cluster.local`, `localhost`) cannot be
+  issued: a test certificate for `keycloak.host.local` fails verification, while
+  `keycloak.host.kind.local` passes. Renaming would also mean reissuing the
+  certificate and re-pointing `KC_HOSTNAME`, Argo CD's issuer and Harbor's
+  endpoint, so the name stayed `keycloak.kind.local`.
 - **Harbor's trust step needs sudo.** `./prepare` creates
   `common/config/shared/trust-certificates/` as root, so copying the root CA in
   is the one privileged action; `registry/oidc-setup.sh` refuses with the exact

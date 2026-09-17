@@ -485,6 +485,20 @@ address works for the browser, for Harbor and for the pods alike.
   rather than skipping verification.
 - **Pods reach it** through a CoreDNS `hosts` entry pointing at the kind bridge
   gateway; `identity/cluster-dns.sh` writes it after every cluster creation.
+- **The cluster names it too.** `platformservices/identity/` holds a namespace
+  and an ExternalName Service, so the external provider appears in the cluster's
+  own naming:
+  `keycloak.identity.svc.cluster.local` → `keycloak.kind.local` → `172.21.0.1`.
+  Use it to find and reach Keycloak — but **not as the OIDC URL**: a client must
+  call the issuer's own hostname, because the token's `iss` has to match what was
+  requested and the certificate only carries `DNS:keycloak.kind.local`.
+- **Why the gateway address and not Keycloak's container IP.** Keycloak sits on
+  its own Docker network (`identity_default`, 172.25.0.0/16). Docker isolates
+  bridges, so neither the pods nor Harbor's containers can route there — only the
+  host can. `172.21.0.1` is the host's address on the kind bridge, and Keycloak
+  publishes its port on it, so browser, Harbor and pods all reach the same
+  endpoint. It also has to be a host address because Docker's embedded DNS
+  forwards to the host resolver, which means `/etc/hosts` is what containers see.
 - **Port 8443** because 80/443 stay reserved for the cluster ingress and Harbor
   holds 3030/3443. The port is part of the issuer URL and of every redirect URI.
 
