@@ -508,20 +508,21 @@ address works for the browser, for Harbor and for the pods alike.
 `platform-admins` get `role:admin`, everyone else `role:readonly`. The local
 `admin` account stays as break-glass.
 
-**Open the `https://` URL.** cloud-provider-kind's Ingress serves
-`http://argocd.kind.local` as well and does *not* redirect to https, so the UI
-loads over plain http and only the login fails, with
+**Both schemes work for the login.** cloud-provider-kind's Ingress serves
+`http://argocd.kind.local` as well and does *not* redirect to https, so a plain
+http page would otherwise fail on "LOG IN VIA KEYCLOAK" with
 
 ```
 Invalid redirect URL: the protocol and host (including port) must match
 and the path must be within allowed URLs if provided
 ```
 
-Argo CD compares the `return_url` of the login request against `url` in
-`argocd-cm` (`https://argocd.kind.local`), and `http://` does not match. If you
-want both schemes to work, add `additionalUrls: ["http://argocd.kind.local"]` to
-`argocd-cm` — but https-only is the honest setting here, since the Ingress has a
-certificate from the local CA.
+Argo CD validates the login request's `return_url` against `url` plus
+`additionalUrls` in `argocd-cm`, so `deploy.sh` sets `url` to the https form and
+lists the http origin in `additionalUrls`. The OIDC `redirect_uri` stays
+`https://argocd.kind.local/auth/callback` either way, which is what the realm
+has registered. Prefer the https URL — it is the one with the certificate from
+the local CA — but the http one no longer locks you out.
 
 **Harbor** is switched over by `registry/oidc-setup.sh`. It needs the root CA in
 Harbor's custom certificate directory first, which `./prepare` created as root:
