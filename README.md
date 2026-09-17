@@ -420,8 +420,9 @@ docker compose -f registry/out/harbor/docker-compose.yml stop   # when you need 
 
 The admin password is in `registry/out/harbor/harbor.yml`
 (`harbor_admin_password`); the user is `admin`. Open
-https://harbor.kind.local:3443 after adding a hosts entry for the kind network
-gateway (see *Browser access*).
+https://harbor.kind.local:3443 — `./hosts.sh` adds the name to its managed block
+once `registry/out/` exists, pointing at the kind bridge gateway, so the browser,
+the pods and the other containers all reach the same endpoint.
 
 **Harbor is on 3030/3443, not 80/443:** those host ports stay reserved for the
 cluster ingress. The HTTPS port is therefore part of the registry name, so images
@@ -448,7 +449,7 @@ To push from your own Docker (optional, needs root once):
 ```bash
 sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443"
 sudo cp pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
-echo "172.21.0.1 harbor.kind.local" | sudo tee -a /etc/hosts
+./hosts.sh          # supplies harbor.kind.local; do not add it by hand as well
 docker login harbor.kind.local:3443
 ```
 
