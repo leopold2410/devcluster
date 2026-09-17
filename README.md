@@ -508,21 +508,24 @@ address works for the browser, for Harbor and for the pods alike.
 `platform-admins` get `role:admin`, everyone else `role:readonly`. The local
 `admin` account stays as break-glass.
 
-**Both schemes work for the login.** cloud-provider-kind's Ingress serves
-`http://argocd.kind.local` as well and does *not* redirect to https, so a plain
-http page would otherwise fail on "LOG IN VIA KEYCLOAK" with
+**Start the login on `https://argocd.kind.local`.** cloud-provider-kind's Ingress
+serves the UI on plain http too and does *not* redirect to https, but the OIDC
+login only completes from the https origin. Starting on http gives one of two
+errors:
 
 ```
-Invalid redirect URL: the protocol and host (including port) must match
-and the path must be within allowed URLs if provided
+Invalid redirect URL: the protocol and host (including port) must match ...
+  -> Argo CD checks the login request's return_url against url in argocd-cm
+
+http: named cookie not present
+  -> Argo CD sets argocd.oauthstate with the Secure flag, so a plain-http page
+     never stores it and the callback on https finds no state cookie
 ```
 
-Argo CD validates the login request's `return_url` against `url` plus
-`additionalUrls` in `argocd-cm`, so `deploy.sh` sets `url` to the https form and
-lists the http origin in `additionalUrls`. The OIDC `redirect_uri` stays
-`https://argocd.kind.local/auth/callback` either way, which is what the realm
-has registered. Prefer the https URL — it is the one with the certificate from
-the local CA — but the http one no longer locks you out.
+Adding the http origin to `additionalUrls` silences the first error but not the
+second, so it is deliberately not configured: the flow would break after the
+password has been typed instead of before. The OIDC `redirect_uri` is always
+`https://argocd.kind.local/auth/callback`, which is what the realm registers.
 
 **Harbor** is switched over by `registry/oidc-setup.sh`. It needs the root CA in
 Harbor's custom certificate directory first, which `./prepare` created as root:

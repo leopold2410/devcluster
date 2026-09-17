@@ -82,15 +82,10 @@ oidc = (
     "requestedScopes: [\"openid\", \"profile\", \"email\", \"groups\"]\n"
     "rootCA: |\n" + ca + "\n"
 )
-print(json.dumps({"data": {
-    "url": "https://argocd.kind.local",
-    # cloud-provider-kind serves the UI on http as well and does not redirect to https.
-    # Without the http origin in additionalUrls, clicking "LOG IN VIA KEYCLOAK" from a
-    # plain-http page fails with "Invalid redirect URL: the protocol and host ... must match",
-    # because Argo CD validates the login request return_url against these URLs.
-    "additionalUrls": "- http://argocd.kind.local\n",
-    "oidc.config": oidc,
-}}))')
+# Only the https origin. Listing http:// in additionalUrls lets the login start there,
+# but it can never finish: Argo CD sets the oauthstate cookie Secure, so a plain-http
+# page never stores it and the callback fails with "named cookie not present".
+print(json.dumps({"data": {"url": "https://argocd.kind.local", "oidc.config": oidc}}))')
     kubectl -n argocd patch configmap argocd-cm --type merge -p "$patch" >/dev/null
     kubectl -n argocd rollout restart deployment/argocd-server
     kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
