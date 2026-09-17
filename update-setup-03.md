@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-16 |
-| Status | **Applied on 2026-09-17.** Keycloak 26.7.3 runs with PostgreSQL on the host, realm `localdev` is applied from code, and Argo CD logs in through it (verified: the server initialises the OIDC provider against the issuer, `/auth/login` redirects to the realm, and an example ID token carries `groups: [platform-admins]`). Harbor's switch is scripted in `registry/oidc-setup.sh` and waits for one root-owned copy of the root CA. See *Implementation notes* |
+| Status | **Applied on 2026-09-17.** Keycloak 26.7.3 runs with PostgreSQL on the host, realm `localdev` is applied from code, and Argo CD logs in through it (verified: the server initialises the OIDC provider against the issuer, `/auth/login` redirects to the realm, and an example ID token carries `groups: [platform-admins]`). Harbor is switched to `oidc_auth` as well (verified: `/c/oidc/login` redirects to the realm with PKCE, and `oidc_verify_cert` stays `true` against the local CA). See *Implementation notes* |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) and [`update-setup-02.md`](update-setup-02.md) |
 
 ## Goals
@@ -519,6 +519,16 @@ these points, all found while applying:
   reachability, not an OIDC URL: the issuer hostname has to be the one the client
   calls, because `iss` must match the request and the certificate only carries
   `DNS:keycloak.kind.local`.
+- **A Service with a manual EndpointSlice to Keycloak's own container IP does not
+  work** — tested, not assumed. `172.25.0.3` is Keycloak's address on
+  `identity_default`, and a ClusterIP Service pointing an EndpointSlice at it
+  resolves but never connects, because the kind *node* cannot reach that address:
+  Docker isolates bridge networks in the host's FORWARD chain, and no Kubernetes
+  object creates a route the host firewall forbids. The node reaches
+  `172.21.0.1:8443` and not `172.25.0.3:8443`, which is why the hosts entry names
+  the gateway. Making the real IP routable would mean attaching every node to
+  `identity_default` after each cluster creation, plus split-horizon DNS, since
+  Harbor's containers still could not route there.
 - **`host.local` was considered and rejected.** A name outside the root CA's
   permitted subtrees (`kind.local`, `svc`, `cluster.local`, `localhost`) cannot be
   issued: a test certificate for `keycloak.host.local` fails verification, while
@@ -545,6 +555,14 @@ GET /auth/login -> 303 https://keycloak.kind.local:8443/realms/localdev/protocol
 example id token: {'iss': '.../realms/localdev', 'aud': 'argocd',
                    'preferred_username': 'dev', 'groups': ['platform-admins']}
 in-cluster: keycloak.kind.local -> 172.21.0.1, port 8443 reachable from a pod
+
+harbor GET /c/oidc/login -> 302 .../realms/localdev/protocol/openid-connect/auth
+                   ?client_id=harbor&code_challenge_method=S256
+                   &redirect_uri=https%3A%2F%2Fharbor.kind.local%3A3443%2Fc%2Foidc%2Fcallback
+                   &scope=openid+profile+email+groups+offline_access
+harbor configurations: auth_mode=oidc_auth, oidc_admin_group=platform-admins,
+                   oidc_auto_onboard=True, oidc_verify_cert=True
+cluster name: keycloak.identity.svc.cluster.local -> CNAME keycloak.kind.local -> 172.21.0.1
 ```
 
 ## Known limitations and open points
