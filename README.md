@@ -104,9 +104,17 @@ without certificate warnings, do these once (both need root):
 
 ```bash
 # 1. Trust the local root CA (name-constrained to kind.local, svc, cluster.local, localhost)
+#    The system store below covers curl, git and friends. Chrome and Firefox do NOT read
+#    it - they keep their own NSS database - so skipping the certutil part leaves every
+#    page failing with ERR_CERT_AUTHORITY_INVALID even though curl is happy.
 sudo cp pki/out/root-ca.crt /usr/local/share/ca-certificates/kind-dev-root-ca.crt
 sudo update-ca-certificates
-certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "kind-dev Root CA" -i pki/out/root-ca.crt  # Chrome/Chromium (libnss3-tools)
+
+sudo apt-get install -y libnss3-tools                    # provides certutil
+mkdir -p "$HOME/.pki/nssdb"
+certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true   # only if there is no database yet
+certutil -d sql:"$HOME/.pki/nssdb" -A -t "C,," -n "kind-dev Root CA" -i pki/out/root-ca.crt
+certutil -d sql:"$HOME/.pki/nssdb" -L | grep kind-dev    # verify, then restart the browser
 # Firefox: Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import
 
 # 2. Host names -> Ingress IPs: all *.kind.local Ingress hosts into a managed block in /etc/hosts
