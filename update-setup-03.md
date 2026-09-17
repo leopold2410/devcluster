@@ -519,6 +519,25 @@ these points, all found while applying:
   reachability, not an OIDC URL: the issuer hostname has to be the one the client
   calls, because `iss` must match the request and the certificate only carries
   `DNS:keycloak.kind.local`.
+- **The browser smoke tests (`tests/`) found three things `curl` could not.** The
+  redirect into Keycloak is all a shell check can see; everything after the login
+  form needs a browser:
+  1. **`openid` is not a Keycloak client scope.** It was listed in
+     `defaultClientScopes` for both clients, and keycloak-config-cli fails
+     resolving it with
+     `NullPointerException: ... because "defaultClientScope" is null`. The client
+     scopes are `basic`, `profile`, `email`, `roles`, `web-origins`, `groups`;
+     `openid` is the request scope every OIDC client sends.
+  2. **Listing `defaultClientScopes` drops Keycloak's optional scopes,** so
+     Harbor's `offline_access` request was rejected and the *callback* failed with
+     `OIDC callback returned error: invalid_scope`. The redirect to Keycloak had
+     looked perfect. Fixed with `optionalClientScopes: [offline_access]` on the
+     `harbor` client.
+  3. **Harbor keeps `sysadmin_flag: false` for OIDC admins.** Rights from
+     `oidc_admin_group` are evaluated per session and reported as
+     `admin_role_in_auth: true`; `sysadmin_flag` is the column for locally
+     promoted admins. The session can read `/api/v2.0/configurations`, which only
+     a sysadmin may, so the rights are real - the flag simply lives elsewhere.
 - **A Service with a manual EndpointSlice to Keycloak's own container IP does not
   work** — tested, not assumed. `172.25.0.3` is Keycloak's address on
   `identity_default`, and a ClusterIP Service pointing an EndpointSlice at it

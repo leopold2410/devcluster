@@ -550,6 +550,39 @@ password.
 service's own OIDC settings — the realm holds platform, application and workload
 identities alike.
 
+## Browser smoke tests (`tests/`)
+
+The OIDC logins are the part `curl` cannot check: the login button, Keycloak's
+form, the callback and the session that comes back are all browser work. Three
+real failures during setup lived exactly there, so they have a test.
+
+```bash
+tests/run.sh                           # both suites
+tests/run.sh specs/harbor.spec.ts      # one service
+tests/run.sh specs/argocd.spec.ts
+tests/run.sh --headed                  # watch it (needs an X server reachable from the container)
+```
+
+One suite per service — `specs/argocd.spec.ts` and `specs/harbor.spec.ts`, with
+the shared Keycloak form handling in `specs/support.ts`.
+
+Playwright runs in a container on the `kind` network, with the host names
+resolved to where the services actually are: `argocd.kind.local` to the
+Ingress's LoadBalancer IP, `keycloak.kind.local` and `harbor.kind.local` to the
+kind bridge gateway. Nothing is installed on the host and no sudo is involved.
+
+- **A real browser:** the Chromium build shipped in the Playwright image, driven
+  with Chrome's device profile. `PLAYWRIGHT_CHANNEL=chrome` switches to branded
+  Google Chrome once the image has fetched it.
+- **Certificates are checked before the browser starts.** The throwaway browser
+  profile does not trust the local CA, so the tests run with
+  `ignoreHTTPSErrors`; `run.sh` verifies all three endpoints with `curl` and the
+  real root CA first, so a broken certificate still fails the run.
+- **What is asserted:** that Argo CD's session reports `dev` with the
+  `platform-admins` group (which is what grants `role:admin`), and that Harbor
+  onboards the same user and marks it a Harbor administrator.
+- **Credentials** come from `identity/out/dev-password`; nothing is hardcoded.
+
 ## Known limitations
 
 [`update-setup-01.md`](update-setup-01.md) has the complete list. The main

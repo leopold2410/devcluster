@@ -9,3 +9,7 @@ charts/
 # Keycloak certificates, secrets, database; .env holds generated passwords
 /identity/out/
 /identity/.env
+# Playwright: dependencies and run artefacts
+/tests/node_modules/
+/tests/test-results/
+/tests/playwright-report/

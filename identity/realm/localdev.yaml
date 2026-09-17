@@ -46,7 +46,10 @@ clients:
       - http://localhost:8085/auth/callback      # argocd CLI, "argocd login --sso"
     webOrigins:
       - https://argocd.kind.local
-    defaultClientScopes: [openid, profile, email, roles, web-origins, groups]
+    # These are Keycloak *client scopes*; "openid" is not one of them, it is the request
+    # scope every OIDC client sends. Listing it makes keycloak-config-cli fail resolving
+    # the name (NullPointerException on defaultClientScope).
+    defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
 
   - clientId: harbor
     name: Harbor
@@ -60,7 +63,11 @@ clients:
       - https://harbor.kind.local:3443/c/oidc/callback   # Harbor's OIDCCallbackPath
     webOrigins:
       - https://harbor.kind.local:3443
-    defaultClientScopes: [openid, profile, email, roles, web-origins, groups]
+    defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
+    # Harbor asks for offline_access (oidc_scope) to get a refresh token. Listing
+    # defaultClientScopes replaces Keycloak's defaults, which drops the optional scopes,
+    # and the callback then fails with "invalid_scope" - after the login, not before.
+    optionalClientScopes: [offline_access]
 
 users:
   - username: dev
