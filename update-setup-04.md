@@ -3,8 +3,30 @@
 | | |
 | --- | --- |
 | Date | 2026-09-16 |
-| Status | **Planned, not yet applied** |
+| Status | **Postponed on 2026-09-18, not applied.** The plan stands; see *Before resuming* for what to re-check and what update-setup-03 taught |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-03.md`](update-setup-03.md) (Keycloak, realm `localdev`) |
+
+## Before resuming
+
+- **Prerequisites are met.** update-setup-03 is applied: Keycloak runs, the realm
+  `localdev` exists, and `tests/run.sh` proves the OIDC logins end to end.
+- **Re-check the versions** — Kubernetes (v1.36.4 at writing) and kubelogin
+  (v1.36.4) will have moved — and the two *Open points* this plan could not
+  verify: the `AuthenticationConfiguration` API version and whether
+  `certificateAuthority` takes inline PEM.
+- **Lessons from applying update-setup-03 that apply here too:**
+  - `openid` is not a Keycloak client scope; listing it in `defaultClientScopes`
+    crashes keycloak-config-cli. Step 1 below is already corrected.
+  - Declaring `defaultClientScopes` drops Keycloak's optional scopes. If
+    kubelogin requests `offline_access` for refresh tokens, the client needs
+    `optionalClientScopes: [offline_access]`, or the callback fails with
+    `invalid_scope` — after a successful login, which `curl` cannot see.
+  - `keycloak.kind.local` resolves to the kind bridge gateway (`172.21.0.1`),
+    not to Keycloak's container IP: the nodes cannot route to
+    `172.25.0.3` (tested). The API server is `hostNetwork`, so it uses the
+    node's `/etc/hosts`, which step 4 writes.
+  - Add a suite to `tests/` for the API-server login, so it is verified the same
+    way the Argo CD and Harbor logins are.
 
 ## Goals
 
@@ -118,7 +140,9 @@ Add to `identity/realm/localdev.yaml` (from update-setup-03):
       - http://localhost:8000     # kubelogin's local listener
       - http://localhost:18000
       - urn:ietf:wg:oauth:2.0:oob # authcode-keyboard
-    defaultClientScopes: [openid, profile, email, roles, groups]
+    # Client scopes only - "openid" is the request scope, not one of these, and listing
+    # it crashes keycloak-config-cli (found while applying update-setup-03).
+    defaultClientScopes: [basic, profile, email, roles, groups]
 ```
 
 And the groups the model above expects:
