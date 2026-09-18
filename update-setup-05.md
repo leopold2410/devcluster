@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-18 |
-| Status | **Planned, not yet applied.** Revision 3: metrics in Prometheus instead of Mimir; collection by the OpenTelemetry Collector as a DaemonSet, reached through one node-local Service, instead of Grafana's `k8s-monitoring`/Alloy (see *Decisions*) |
+| Status | **Applied and verified on 2026-09-18.** Revision 3 of the plan: metrics in Prometheus instead of Mimir; collection by the OpenTelemetry Collector as a DaemonSet behind one node-local Service instead of Grafana's `k8s-monitoring`/Alloy. The running cluster corrected a number of details — see *Implementation notes*; where the steps below differ, the files in `platformservices/monitoring/` are authoritative |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) (platform services, cert-manager, trust-manager), [`update-setup-02.md`](update-setup-02.md) (TopoLVM) and [`update-setup-03.md`](update-setup-03.md) (Keycloak) |
 
 ## Goals
@@ -755,7 +755,7 @@ apply monitoring/namespace
 apply monitoring/prometheus;      kubectl -n monitoring rollout status deployment/prometheus-server --timeout=300s
 apply monitoring/loki;            kubectl -n monitoring rollout status statefulset/loki --timeout=300s
 apply monitoring/tempo;           kubectl -n monitoring rollout status statefulset/tempo --timeout=300s
-apply monitoring/otel-collector;  kubectl -n monitoring rollout status daemonset/otel-collector --timeout=300s
+apply monitoring/otel-collector;  kubectl -n monitoring rollout status daemonset/otel-collector-agent --timeout=300s
 apply monitoring/grafana;         available monitoring
 ```
 
@@ -765,9 +765,9 @@ apply monitoring/grafana;         available monitoring
 done once:**
 
 ```bash
-kubectl -n monitoring get daemonset otel-collector            # DESIRED = READY = 3
+kubectl -n monitoring get daemonset otel-collector-agent         # DESIRED = READY = 3
 kubectl -n monitoring get svc otel-collector -o jsonpath='{.spec.internalTrafficPolicy}'; echo   # Local
-kubectl -n monitoring get daemonset otel-collector -o jsonpath='{..hostPort}'; echo              # empty
+kubectl -n monitoring get daemonset otel-collector-agent -o jsonpath='{..hostPort}'; echo              # empty
 kubectl -n monitoring get lease                               # one holder per lease
 ```
 
@@ -807,7 +807,7 @@ curl -s 'localhost:9090/api/v1/query_exemplars?query=traces_spanmetrics_latency_
 kubectl -n monitoring port-forward svc/loki 3100 &
 curl -s 'localhost:3100/loki/api/v1/query_range' --data-urlencode 'query={k8s_namespace_name="argocd"}' | head -c 300
 kubectl -n monitoring port-forward svc/tempo 3200 &
-curl -s 'localhost:3200/api/search?limit=5' | head -c 300
+curl -s "localhost:3200/api/search?limit=5&start=$(( $(date +%s) - 1800 ))&end=$(date +%s)" | head -c 300   # Tempo 3 needs the range
 ```
 
 **Grafana, in the browser** at `https://grafana.kind.local`: *Sign in with
@@ -950,6 +950,90 @@ Next to *Storage* and *Registry*, in the same shape:
 
 Every Mermaid diagram in `architecture.md` renders: extract each block and run
 it through `mermaid-cli`, as for the existing diagrams.
+
+## Implementation notes
+
+The files in `platformservices/monitoring/` are authoritative. They differ from
+the steps above in these points, each found on the running cluster:
+
+**The collector**
+- **The DaemonSet is `otel-collector-agent`.** The chart appends `-agent` in
+  DaemonSet mode even with `fullnameOverride`; the Service keeps the plain name.
+  The commands in Steps 9 and 10 are corrected.
+- **It needs a toleration for the control plane.** Without it, no collector ran
+  on `dev-control-plane`, so the API server's, etcd's and the scheduler's logs
+  were missing.
+- **`kubelet_stats` cannot work on this host**, for two reasons found one after
+  the other: kind's kubelets serve a self-signed certificate from a per-node CA
+  that names only `DNS:dev-worker`, no IP; and once that is skipped, the kubelet
+  answers `/stats/summary` with **500** — *"cannot find filesystem info for device
+  rpool/…"*, the ZFS limitation of ADR-0011. `/metrics/cadvisor` works, so
+  container metrics come from a Prometheus scrape of it
+  (`prometheus/kubelet`, `nodes/metrics` RBAC added, TLS verification skipped for
+  this call only). They carry cAdvisor's names (`container_*`), with `k8s_*`
+  labels added so they join with the rest.
+- **The `annotationDiscovery` preset follows OpenTelemetry's own annotations**
+  (`io.opentelemetry.discovery.metrics/*`), not `prometheus.io/*`, so it found
+  neither Istio nor cert-manager. A plain Prometheus receiver
+  (`prometheus/pods`) scrapes annotated pods instead, each collector only its own
+  node's.
+- **Host metrics carried no node identity**, so the three nodes' series
+  collided into one (`system_cpu_load_average_1m` had a single, label-less
+  series). The `hostMetrics` preset appends its receiver to the shared pipeline,
+  so it is replaced: the receiver and its read-only `/` → `/hostfs` mount are
+  defined by hand, in a `metrics/host` pipeline that stamps `k8s.node.name`.
+  Its scrapers are written `{}`, not the preset's `null` (see below).
+- **kustomize drops `key: null` from `valuesInline`** before Helm sees it, so
+  chart defaults cannot be removed that way. The collector's unused Jaeger and
+  Zipkin receivers simply stay defined and unreferenced; the binary accepts that.
+
+**The backends and Grafana**
+- **Tempo's generator ran no processors:** the chart's `tempo.overrides.defaults`
+  is empty, and the generator only runs what a tenant's overrides list.
+  `service-graphs` and `span-metrics` are enabled there; the generator's storage
+  moved from `/tmp/tempo` onto the volume; exemplars are switched on in its
+  `storage.remote_write` list.
+- **Tempo keeps an unused Jaeger receiver.** Its Service template dereferences the
+  Jaeger block, so with Helm directly `jaeger: null` fails the render, and through
+  kustomize the null never arrives.
+- **Tempo 3 search needs a time range** (`start`, `end`); without one it returns
+  nothing. Grafana always sends one; the Step 10 command is corrected.
+- **Tempo's exemplars are labelled `traceID`**, not `trace_id`
+  (`/api/v1/query_exemplars`). Grafana's `exemplarTraceIdDestinations` uses
+  `traceID`; with the planned name, the metric → trace link would silently never
+  have worked.
+- **Grafana grants server admin only for `'GrafanaAdmin'`.** With
+  `allow_assign_grafana_admin`, the planned `'Admin'` would have stopped at the
+  organisation; the browser test asserts `isGrafanaAdmin`.
+- **Dashboards from this repository go through `dashboardsConfigMaps`**, filled
+  by a kustomize `configMapGenerator`: the chart's `dashboards: … file:` reads
+  from inside its own package. The dashboard is a *Cluster overview* written for
+  the metrics this cluster has; community Kubernetes dashboards expect
+  kube-state-metrics and node-exporter. Istio's three are pinned at revisions
+  330, 329 and 330.
+- **Grafana's OIDC secret reference is `optional`**, and `deploy.sh` generates a
+  local admin when `identity/out/` is absent, so Grafana also starts on a cluster
+  without Keycloak.
+- **The namespace is a part of its own** (`monitoring/namespace`): kustomize
+  does not load files from outside a part's directory.
+
+Verification evidence (2026-09-18):
+
+```
+backends     OTLP metric 200, log 204, span 200, each read back;
+             smoke_test{k8s_namespace_name="smoke-ns"}: attribute promotion works
+collector    3/3 pods, control plane included; one holder per lease;
+             count(k8s_node_condition_ready) = 3, not 9; no error lines
+containers   CPU series per node 30 / 81 / 59; up{job="kubelet-cadvisor"} = 1 on all three
+scraped      istio_* 55, pilot_* 42, envoy_* 221, certmanager_* 13 metric families
+logs         8+ namespaces incl. kube-system (the API server's own lines); events stream
+mesh         60 requests -> span metrics 60 / 30 / 30; service graph user -> gateway -> nginx;
+             15 exemplars, label traceID
+restart      Loki stopped 74 s, dev-worker's collector replaced mid-outage
+             -> 120 of 120 log lines in Loki, none missing
+browser      4 of 4: Argo CD (twice), Harbor, Grafana (GrafanaAdmin, 3 data sources OK)
+deploy.sh    full run exit 0 in 64 s; Grafana secrets "unchanged" on re-run
+```
 
 ## Known limitations and open points
 

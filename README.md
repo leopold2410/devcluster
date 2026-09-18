@@ -55,6 +55,7 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 │   ├── kustomization.yaml    # renders everything: kubectl kustomize --enable-helm platformservices
 │   ├── deploy.sh             # applies the parts in dependency order
 │   ├── cert-manager/  trust-manager/  istio/  external-secrets/  argocd/
+│   ├── monitoring/           # OpenTelemetry Collector, Prometheus, Loki, Tempo, Grafana
 │   └── keda/                 # old 2.11.0 manifest, not deployed
 ├── storage/              # host side of TopoLVM: loop device, volume group, lvmd systemd units
 ├── registry/             # Harbor via Docker Compose; out/ is generated (git-ignored)
@@ -559,6 +560,44 @@ password.
 service's own OIDC settings — the realm holds platform, application and workload
 identities alike.
 
+## Monitoring (`platformservices/monitoring/`)
+
+Metrics, logs and traces, deployed by `./deploy.sh` with the other platform
+services. The design and its reasons are in `architecture.md` (*Observability*,
+ADR-0019 to ADR-0022).
+
+- **Open https://grafana.kind.local** and choose *Sign in with Keycloak* (`dev`
+  lands as server admin). `./hosts.sh` adds the name, since it is an Ingress
+  host. The local `admin` stays as break-glass; its password is in
+  `identity/out/grafana-admin-password`.
+- **Dashboards:** *Platform / Cluster overview*, built for the metrics this
+  cluster actually has, and Istio's Mesh, Service and Workload dashboards, pinned
+  by revision.
+- **Sending telemetry from a service:** one endpoint for everything, answered by
+  the collector on the pod's own node:
+
+  ```yaml
+  env:
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://otel-collector.monitoring.svc:4318
+    - name: OTEL_EXPORTER_OTLP_PROTOCOL
+      value: http/protobuf
+  ```
+
+  Pod logs need nothing at all: the collector reads them from each node. Pods
+  annotated `prometheus.io/scrape`, `prometheus.io/port` (and optionally
+  `prometheus.io/path`) are scraped as well.
+- **Mesh traces come for free:** Istio sends every sidecar's spans (100 %
+  sampling), and Tempo turns them into span metrics and a service graph. Send a
+  few requests to `testapp-mesh.kind.local` and open the service graph in
+  Grafana's *Explore → Tempo*.
+- **Memory:** roughly 1.2–2 GiB for the whole stack. If the host gets tight,
+  stop Harbor first.
+
+Worth knowing on this host: container metrics come from the kubelet's cAdvisor
+endpoint, because its summary API fails on ZFS; and host metrics show the host
+machine for every node, because kind's nodes share its kernel.
+
 ## Browser smoke tests (`tests/`)
 
 The OIDC logins are the part `curl` cannot check: the login button, Keycloak's
@@ -572,8 +611,11 @@ tests/run.sh specs/argocd.spec.ts
 tests/run.sh --headed                  # watch it (needs an X server reachable from the container)
 ```
 
-One suite per service — `specs/argocd.spec.ts` and `specs/harbor.spec.ts`, with
-the shared Keycloak form handling in `specs/support.ts`.
+One suite per service — `specs/argocd.spec.ts`, `specs/harbor.spec.ts` and
+`specs/grafana.spec.ts`, with the shared Keycloak form handling in
+`specs/support.ts`. The Grafana suite runs only when monitoring is deployed
+(`run.sh` looks for its Ingress), and also asserts that all three data sources
+pass Grafana's own health check.
 
 Playwright runs in a container on the `kind` network, with the host names
 resolved to where the services actually are: `argocd.kind.local` to the
