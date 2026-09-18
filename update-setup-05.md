@@ -822,6 +822,135 @@ service graph shows the mesh.
 - call `/api/datasources/uid/{prometheus,loki,tempo}/health` in the logged-in
   session and assert all three are `OK`.
 
+## Step 11: Document the architecture in `architecture.md`
+
+After Step 10 has passed, so the documentation describes what was proven rather
+than what was planned. `architecture.md` keeps one decision per ADR, in Michael
+Nygard's form — context, decision, consequences — and its diagrams must render
+on GitHub.
+
+### 11.1 Four ADRs, one decision each
+
+ADR-0018 stays reserved by the postponed update-setup-04, so these continue at
+0019. Each records the alternatives that were weighed: this plan went through
+three revisions, and the reasons are the part worth keeping.
+
+| ADR | Decision | Alternatives on record |
+| --- | --- | --- |
+| **0019** | Collect with the OpenTelemetry Collector | Grafana Alloy; Grafana's `k8s-monitoring` |
+| **0020** | Run it as a DaemonSet behind one node-local Service, with persistent send queues | Deployment-only gateway; agent plus gateway; `hostPort` |
+| **0021** | Prometheus as the metrics store, fed over OTLP | Mimir (plain manifests or `mimir-distributed`); `kube-prometheus-stack` |
+| **0022** | Monolithic Loki and Tempo on TopoLVM volumes, charts from `grafana-community` | Scalable modes; object storage; the deprecated or GEL-only charts in `grafana/` |
+
+Drafts, to be adjusted to what Step 10 showed:
+
+**ADR-0019: Collection with the OpenTelemetry Collector.**
+*Context.* Metrics, logs and traces have to be collected from the nodes, the
+workloads and the mesh. Grafana's `k8s-monitoring` chart and the upstream
+collector both do it. Alloy is Grafana's distribution of the same OpenTelemetry
+components with its own configuration language, and `k8s-monitoring` 4.x still
+needs collectors defined and every feature assigned by hand.
+*Decision.* The upstream collector, Kubernetes distribution
+(`otel/opentelemetry-collector-k8s`), configured through the chart's presets,
+sending OTLP to every backend.
+*Consequences.* Vendor-neutral configuration in plain YAML. Infrastructure
+metrics carry OpenTelemetry names, so dashboards are chosen for them. Chart and
+image are upgraded together and re-checked with `otelcol-k8s validate`, because
+the presets rely on component-name aliases that 0.160 still accepts.
+
+**ADR-0020: The collector as a DaemonSet behind one node-local Service.**
+*Context.* Pod logs exist only as files on each node, and the collector has no
+receiver that reads them through the Kubernetes API. Services should have a
+single endpoint. A single Service name is not a single processing point, and
+nothing planned needs one.
+*Decision.* A DaemonSet. Service `otel-collector` with
+`internalTrafficPolicy: Local` as the only endpoint, for services and Istio
+alike; no `hostPort`; cluster-wide receivers under leader election; send queues
+on the node's disk. A gateway is added when tail sampling, central filtering or
+an export outside the cluster requires it.
+*Consequences.* One address, no cross-node hop, the sending pod identified by
+its connection. A restart loses only what services push during the seconds it
+is down; logs resume from their checkpoint and queued data survives. The queues
+last as long as the node, not longer.
+
+**ADR-0021: Prometheus as the metrics store, fed over OTLP.**
+*Context.* Mimir was the first choice. Its chart (`mimir-distributed` 6.2.0)
+enables Kafka, MinIO and a dozen components and has no monolithic mode, and
+Mimir's strengths — scale-out, object-storage retention, multi-tenancy — do not
+apply to one node. `kube-prometheus-stack` would duplicate the collection layer
+and bring its own Grafana.
+*Decision.* Prometheus 3 for storage and queries only: an OTLP receiver for the
+collector, a remote-write receiver for Tempo's span metrics, exemplar storage,
+Kubernetes resource attributes promoted to labels, every scrape job but its own
+disabled.
+*Consequences.* One process from a maintained chart; Grafana is unaffected if
+Mimir is ever added behind remote write. Exemplars live in memory, so
+metric → trace links exist for recent data only. Retention is bound by a 15 GiB
+volume.
+
+**ADR-0022: Monolithic Loki and Tempo on local volumes.**
+*Context.* Scalable modes and object storage serve throughput and availability
+this cluster does not need. The charts moved: `grafana`, `tempo` and
+`tempo-distributed` are deprecated in `grafana/helm-charts`, and Loki's chart
+there is for Grafana Enterprise Logs only.
+*Decision.* Loki in `Monolithic` mode and Tempo 3 monolithic, filesystem storage
+on TopoLVM, 7 days and 72 hours of retention, charts from `grafana-community`.
+*Consequences.* A small footprint and no object store to run; no high
+availability; the data lives and dies with the cluster; the charts come from a
+community repository, whose releases need watching.
+
+Grafana's Keycloak login needs no ADR of its own: it applies ADR-0017's pattern
+and is documented under *Identities and roles* (11.4).
+
+### 11.2 The C4 container diagram
+
+Add the five components to the *Platform services* boundary, with their
+relations:
+
+- containers `otelcol` (OpenTelemetry Collector, DaemonSet behind Service
+  `otel-collector`), `prometheus`, `loki`, `tempo`, `grafana`;
+- `apps → otelcol` (telemetry, OTLP); `otelcol → prometheus`, `→ loki`,
+  `→ tempo` (OTLP); `tempo → prometheus` (span metrics, remote write);
+  `grafana → prometheus`, `→ loki`, `→ tempo` (queries);
+  `grafana → keycloak` (OIDC); `dev → grafana` (explores telemetry, HTTPS).
+
+Relations must name containers, never boundaries: Mermaid's C4 renderer rejects
+a relation that targets a boundary — the error met when the diagram was first
+split into boundaries.
+
+### 11.3 An *Observability* section
+
+Next to *Storage* and *Registry*, in the same shape:
+
+- the data-flow diagram from this plan's *Architecture* section;
+- the single endpoint for services, `otel-collector.monitoring.svc:4317/4318`,
+  and why it is node-local;
+- what a collector restart can lose (from *Known limitations*);
+- retention per signal, and the correlation paths: metric → trace,
+  trace → logs and metrics, log → trace, the service graph.
+
+### 11.4 *Identities and roles*
+
+- the flow diagram gains Grafana, reached by `platform-admins` (Admin and server
+  admin) and `platform-users` (Editor), with its local `admin` as one more
+  break-glass account;
+- the credentials table gains `identity/out/grafana-client-secret`,
+  `identity/out/grafana-admin-password`, and the Secrets `grafana-oidc` and
+  `grafana-admin` in `monitoring`;
+- the group-to-rights table gains a Grafana column.
+
+### 11.5 README and this plan's status
+
+- README: a *Monitoring* section — how to open Grafana, the endpoint for
+  services, and the smoke test (`tests/run.sh specs/grafana.spec.ts`).
+- This file: status *applied*, with Step 10's evidence, and implementation notes
+  for whatever differed from the plan — as update-setup-03 did.
+
+### 11.6 Check
+
+Every Mermaid diagram in `architecture.md` renders: extract each block and run
+it through `mermaid-cli`, as for the existing diagrams.
+
 ## Known limitations and open points
 
 - **What a collector restart can lose.** `internalTrafficPolicy: Local` has no
@@ -864,27 +993,3 @@ service graph shows the mesh.
   behave differently — to be seen.
 - **No high availability, by design; retention is disk-bound; alerting is out of
   scope.**
-
-## Planned ADR (for `architecture.md` once applied)
-
-**ADR-0019: Observability with the OpenTelemetry Collector, Prometheus, Loki,
-Tempo and Grafana.** (ADR-0018 is reserved by the postponed update-setup-04.)
-Context: the platform had no metrics, logs or traces. The Grafana stack covers
-the three signals with correlation between them, and Grafana fits the Keycloak
-login. Mimir and Grafana's Alloy-based `k8s-monitoring` were the first drafts;
-Mimir's chart defaults to Kafka with no monolithic mode, and Alloy ties the
-collection layer to one vendor's configuration language. Decision: one
-OpenTelemetry Collector DaemonSet — pod logs and host metrics exist only per
-node — reached by every service and by Istio through a single Service with
-`internalTrafficPolicy: Local`, without host ports; cluster-wide receivers under
-leader election; no gateway until central processing is needed. OTLP end to end
-into Prometheus (store and query only, with promoted resource attributes and
-exemplar storage), Loki and Tempo, all monolithic on TopoLVM volumes; Grafana as
-a Keycloak client with roles from the groups claim. Consequences: vendor-neutral
-collection in plain YAML, one endpoint for every service and no cross-node hop,
-links between all three signals, at roughly 1.2–2 GiB of memory; OpenTelemetry
-metric names instead of the classic Prometheus ones, so dashboards are chosen for
-them; persistent send queues, so a collector restart loses no logs and no
-accepted data — only what services push during the seconds it is down;
-exemplars only for recent data; chart and collector image pinned together because the presets rely
-on name aliases; no high availability.
