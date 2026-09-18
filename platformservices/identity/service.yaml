@@ -3,7 +3,7 @@
 #
 #   keycloak.identity.svc.cluster.local  ->  CNAME  ->  keycloak.kind.local  ->  172.21.0.1
 #
-# The second hop is the hosts block that identity/cluster-dns.sh puts into CoreDNS; the
+# The second hop is the hosts block that cluster/host-services-dns.sh puts into CoreDNS; the
 # address is the kind bridge gateway, which is the host as the cluster sees it.
 #
 # Use it to discover and to reach Keycloak - but not as the OIDC URL. An OIDC client has

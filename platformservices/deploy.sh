@@ -50,6 +50,12 @@ apply istio/config
 
 # 3. External Secrets Operator
 apply external-secrets;     available external-secrets
+# ESO reads Vault through Kubernetes auth (update-setup-06), when Vault is set up. The store's
+# service account is bound to system:auth-delegator, because Vault reviews each login with it.
+if [[ -s "$SCRIPT_DIR/../vault/out/root-token" ]]; then
+    apply external-secrets/vault
+    kubectl wait clustersecretstore/vault --for=condition=Ready --timeout=120s
+fi
 
 # 4. Argo CD: one instance for the whole cluster
 apply argocd;               available argocd

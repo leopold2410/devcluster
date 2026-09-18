@@ -15,6 +15,7 @@ resources:
 - istio/gateway
 - istio/config
 - external-secrets
+- external-secrets/vault
 - identity
 - argocd
 - monitoring

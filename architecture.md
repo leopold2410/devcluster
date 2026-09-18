@@ -635,7 +635,7 @@ accounts stay as break-glass.
 **Consequences.** One login for the platform, identity survives cluster rebuilds,
 and each further service is one client plus its own OIDC settings. Argo CD
 verifies the issuer through `rootCA` instead of skipping verification, and pods
-resolve the issuer through a CoreDNS hosts entry that `identity/cluster-dns.sh`
+resolve the issuer through a CoreDNS hosts entry that `cluster/host-services-dns.sh`
 re-applies after every cluster creation. Against that: logging in now depends on
 Keycloak running, the port appears in the issuer URL and in every redirect URI,
 Harbor's trust step needs one root-owned copy of the root CA, and the in-cluster

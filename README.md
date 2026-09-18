@@ -29,7 +29,9 @@ registry/setup-host.sh        # optional: Harbor (sudo only for its ./prepare st
 registry/kind-trust.sh        # after every "cluster.sh up" if Harbor is used
 
 identity/setup-host.sh        # optional: Keycloak (no root; one /etc/hosts line is yours)
-identity/cluster-dns.sh       # after every "cluster.sh up" if Keycloak is used
+cluster/host-services-dns.sh  # after every "cluster.sh up": pods resolve Keycloak and Vault
+
+vault/setup-host.sh           # optional: Vault (no root; unseals after every restart)
 ```
 
 You need on `PATH`:
@@ -470,7 +472,7 @@ Harbor are its clients, so one login covers the platform.
 
 ```bash
 identity/setup-host.sh              # certificate, secrets, containers, realm (no root)
-identity/cluster-dns.sh             # after every cluster.sh up: CoreDNS entry for the pods
+cluster/host-services-dns.sh             # after every cluster.sh up: CoreDNS entry for the pods
 docker compose -f identity/compose.yaml ps
 docker compose -f identity/compose.yaml stop     # when you need the memory
 ```
@@ -494,7 +496,7 @@ address works for the browser, for Harbor and for the pods alike.
   root CA trusts Keycloak. Argo CD verifies it through `rootCA` in `oidc.config`
   rather than skipping verification.
 - **Pods reach it** through a CoreDNS `hosts` entry pointing at the kind bridge
-  gateway; `identity/cluster-dns.sh` writes it after every cluster creation.
+  gateway; `cluster/host-services-dns.sh` writes it after every cluster creation.
 - **The cluster names it too.** `platformservices/identity/` holds a namespace
   and an ExternalName Service, so the external provider appears in the cluster's
   own naming:

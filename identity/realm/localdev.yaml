@@ -85,6 +85,21 @@ clients:
       pkce.code.challenge.method: S256
     defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
 
+  - clientId: vault                    # update-setup-06
+    name: Vault
+    enabled: true
+    publicClient: false
+    standardFlowEnabled: true
+    directAccessGrantsEnabled: false
+    secret: $(env:VAULT_CLIENT_SECRET)
+    rootUrl: https://vault.kind.local:8200
+    redirectUris:
+      - https://vault.kind.local:8200/ui/vault/auth/oidc/oidc/callback   # the UI
+      - http://localhost:8250/oidc/callback                               # vault login -method=oidc
+    webOrigins:
+      - https://vault.kind.local:8200
+    defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
+
 users:
   - username: dev
     enabled: true

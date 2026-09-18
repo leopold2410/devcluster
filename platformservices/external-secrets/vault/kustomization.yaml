@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# ESO reads Vault through Kubernetes auth (update-setup-06). Applied after ESO, and by
+# platformservices/deploy.sh only once Vault is set up (vault/out/root-token exists).
+resources:
+- vault-auth.yaml
+- clustersecretstore.yaml

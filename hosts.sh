@@ -49,16 +49,13 @@ if ! $remove; then
                 for (h in ip) print ip[h], h
             }' | sort -k2)
 
-    # Keycloak is not an Ingress: it runs in Docker Compose on this host, so the browser
-    # reaches it on the loopback address. Only once it is set up, so a setup without
-    # identity/ gets no entry for it. (The pods use CoreDNS instead: identity/cluster-dns.sh.)
-    # Host-side services: Keycloak and Harbor are not Ingresses, they run in Docker Compose
-    # on this host. Each is added once it has been set up, so a setup without them gets no
-    # entry. They point at the kind bridge gateway rather than 127.0.0.1, because Docker's
-    # embedded DNS forwards to the host resolver, which reads this file: containers see
-    # these entries too, and a container's own loopback is not the host's. Both services
+    # Host-side services: Keycloak, Harbor and Vault are not Ingresses, they run in Docker
+    # Compose on this host. Each is added once it has been set up, so a setup without them
+    # gets no entry. They point at the kind bridge gateway rather than 127.0.0.1, because
+    # Docker's embedded DNS forwards to the host resolver, which reads this file: containers
+    # see these entries too, and a container's own loopback is not the host's. The services
     # publish on the gateway, so one address serves the browser, the pods and the other
-    # containers alike.
+    # containers alike. (Pods resolve them through CoreDNS: cluster/host-services-dns.sh.)
     gateway_ip=$(docker network inspect kind -f '{{range .IPAM.Config}}{{if .Gateway}}{{.Gateway}} {{end}}{{end}}' 2>/dev/null |
         tr ' ' '\n' | grep -v ':' | head -1)
     gateway_ip=${gateway_ip:-127.0.0.1}
@@ -67,6 +64,9 @@ if ! $remove; then
     fi
     if [[ -d "$SCRIPT_DIR/registry/out" ]]; then
         entries+=$'\n'"$gateway_ip ${HARBOR_HOSTNAME:-harbor.kind.local}"
+    fi
+    if [[ -d "$SCRIPT_DIR/vault/out" ]]; then
+        entries+=$'\n'"$gateway_ip ${VAULT_HOSTNAME:-vault.kind.local}"
     fi
 
     while read -r ip host; do

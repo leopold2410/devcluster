@@ -1,0 +1,34 @@
+# HashiCorp Vault outside the cluster (update-setup-06). Like Keycloak and Harbor, it exists
+# before the cluster and survives "cluster/cluster.sh down".
+# Variables come from ./.env, written by vault/setup-host.sh.
+name: vault
+
+services:
+  vault:
+    image: hashicorp/vault:${VAULT_VERSION:?run vault/setup-host.sh}
+    restart: unless-stopped
+    command: ["server"]
+    # The host user, so the data files in out/file stay owned by it.
+    user: "${HOST_UID:?}:${HOST_GID:?}"
+    environment:
+      VAULT_ADDR: https://localhost:8200      # for the CLI inside the container
+      VAULT_CACERT: /vault/tls/ca.crt
+    volumes:
+      - ./vault.hcl:/vault/config/vault.hcl:ro
+      - ./out/file:/vault/file
+      - ./out/tls:/vault/tls:ro
+    ports:
+      # The browser on this host, and the pods via the kind bridge gateway (the host).
+      - "127.0.0.1:${VAULT_PORT}:8200"
+      - "${KIND_GATEWAY:?}:${VAULT_PORT}:8200"
+    extra_hosts:
+      # For the OIDC discovery; independent of the host's /etc/hosts.
+      - "keycloak.kind.local:${KIND_GATEWAY}"
+    # The kind network as a second network: the only way a container reaches the API server
+    # (dev-control-plane:6443) for TokenReview. kubectl's route, the host loopback, is not
+    # reachable from a container (measured in update-setup-06).
+    networks: [default, kind]
+
+networks:
+  kind:
+    external: true

@@ -9,6 +9,11 @@ charts/
 # Keycloak certificates, secrets, database; .env holds generated passwords
 /identity/out/
 /identity/.env
+# Vault: data, certificates, init keys and root token; Terraform state holds secrets too
+/vault/out/
+/vault/.env
+/vault/config/terraform.tfstate*
+/vault/config/.terraform/
 # Playwright: dependencies and run artefacts
 /tests/node_modules/
 /tests/test-results/

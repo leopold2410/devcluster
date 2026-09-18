@@ -33,6 +33,13 @@ grafana_args=()
 if [[ -n $GRAFANA_IP ]]; then
     grafana_args=(--add-host "grafana.kind.local:$GRAFANA_IP" -e GRAFANA_URL=https://grafana.kind.local)
 fi
+# Vault is optional too: its suite runs once it is set up (update-setup-06).
+VAULT_URL=""
+vault_args=()
+if [[ -s "$SCRIPT_DIR/../vault/out/root-token" ]]; then
+    VAULT_URL="https://${VAULT_HOSTNAME:-vault.kind.local}:${VAULT_PORT:-8200}"
+    vault_args=(--add-host "${VAULT_HOSTNAME:-vault.kind.local}:$HOST_IP" -e VAULT_URL="$VAULT_URL")
+fi
 
 ARGOCD_URL="https://argocd.kind.local"
 HARBOR_URL="https://$HARBOR_HOSTNAME:$HARBOR_HTTPS_PORT"
@@ -53,6 +60,13 @@ if [[ -n $GRAFANA_IP ]]; then
     curl -fsS -o /dev/null --cacert "$PKI/root-ca.crt" --resolve "grafana.kind.local:443:$GRAFANA_IP" \
         https://grafana.kind.local/api/health && echo OK
 fi
+if [[ -n $VAULT_URL ]]; then
+    # sys/health answers 503 while Vault is sealed, so a sealed Vault fails here, not in the browser
+    printf '   %-60s ' "$VAULT_URL/v1/sys/health"
+    curl -fsS -o /dev/null --cacert "$PKI/root-ca.crt" \
+        --resolve "${VAULT_HOSTNAME:-vault.kind.local}:${VAULT_PORT:-8200}:127.0.0.1" \
+        "$VAULT_URL/v1/sys/health" && echo OK
+fi
 
 echo "== playwright"
 docker run --rm --init --network kind \
@@ -60,6 +74,7 @@ docker run --rm --init --network kind \
     --add-host "$KEYCLOAK_HOSTNAME:$HOST_IP" \
     --add-host "$HARBOR_HOSTNAME:$HOST_IP" \
     "${grafana_args[@]}" \
+    "${vault_args[@]}" \
     -e ARGOCD_URL="$ARGOCD_URL" \
     -e HARBOR_URL="$HARBOR_URL" \
     -e KEYCLOAK_REALM="$KEYCLOAK_REALM" \

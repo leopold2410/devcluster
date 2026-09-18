@@ -1,0 +1,22 @@
+# The identity ESO logs in to Vault with (update-setup-06, ADR-0024). Vault stores no token
+# reviewer of its own: it checks each login by calling the TokenReview API with the very token
+# it was given. So this service account must be allowed to review tokens - exactly what
+# system:auth-delegator grants, and the only permission it has.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth
+  namespace: external-secrets
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-auth-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault-auth
+    namespace: external-secrets

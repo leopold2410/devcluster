@@ -24,6 +24,7 @@ gen argocd-client-secret
 gen harbor-client-secret
 gen grafana-client-secret
 gen grafana-admin-password     # Grafana's local admin, the break-glass account (update-setup-05)
+gen vault-client-secret        # update-setup-06
 gen dev-password
 
 "$SCRIPT_DIR/create-cert.sh"
@@ -66,6 +67,7 @@ docker run --rm --network identity_default \
     -e ARGOCD_CLIENT_SECRET="$(cat "$OUT/argocd-client-secret")" \
     -e HARBOR_CLIENT_SECRET="$(cat "$OUT/harbor-client-secret")" \
     -e GRAFANA_CLIENT_SECRET="$(cat "$OUT/grafana-client-secret")" \
+    -e VAULT_CLIENT_SECRET="$(cat "$OUT/vault-client-secret")" \
     -e DEV_USER_PASSWORD="$(cat "$OUT/dev-password")" \
     -v "$SCRIPT_DIR/realm:/config:ro" \
     "adorsys/keycloak-config-cli:${KEYCLOAK_CONFIG_CLI_VERSION}"
@@ -75,5 +77,5 @@ echo "Keycloak:  $URL   (add '127.0.0.1 $KEYCLOAK_HOSTNAME' to /etc/hosts)"
 echo "Admin:     admin / $(cat "$OUT/admin-password")"
 echo "Realm:     $KEYCLOAK_REALM   user: dev / $(cat "$OUT/dev-password")"
 echo
-echo "Next: identity/cluster-dns.sh   (after every cluster/cluster.sh up, so pods resolve $KEYCLOAK_HOSTNAME)"
+echo "Next: cluster/host-services-dns.sh   (after every cluster/cluster.sh up, so pods resolve $KEYCLOAK_HOSTNAME)"
 echo "Stop:  docker compose -f $SCRIPT_DIR/compose.yaml stop"
