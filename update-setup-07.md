@@ -1,20 +1,22 @@
-# Update setup 07: Harbor as a Docker Hub mirror for the cluster
+# Update setup 07: Harbor as a mirror for every registry the cluster pulls from
 
 | | |
 | --- | --- |
 | Date | 2026-09-19 |
 | Status | **Planned, not yet applied** |
-| Scope | `/home/leo/dev/kind`, builds on [`update-setup-02.md`](update-setup-02.md) (Harbor, `registry/kind-trust.sh`), where this was listed as a follow-up |
+| Scope | `/home/leo/dev/kind`, builds on [`update-setup-02.md`](update-setup-02.md) (Harbor, `registry/kind-trust.sh`), where a Docker Hub mirror was listed as a follow-up |
 
 ## Goals
 
-1. **Docker Hub images are pulled through Harbor,** which keeps a copy: a second
-   pull — on the next cluster rebuild, or on another node — comes from the host,
-   not from the internet.
-2. **Transparent:** image names stay as they are. `nginx:1.27` and
-   `grafana/grafana:13.2.2` keep working; no manifest, chart or `values` changes.
-3. **No new single point of failure:** if Harbor is down, the nodes pull from
-   Docker Hub directly, as today.
+1. **Every image the cluster pulls goes through Harbor,** which keeps a copy — for
+   all five registries the cluster uses today: Docker Hub, quay.io, ghcr.io,
+   registry.k8s.io and public.ecr.aws. A second pull, on the next cluster
+   rebuild or on another node, comes from the host, not from the internet.
+2. **Transparent:** image names stay as they are. `nginx:1.27`,
+   `quay.io/argoproj/argocd:v3.5.3` and `registry.k8s.io/pause:3.10` keep working;
+   no manifest, chart or `values` changes.
+3. **No new single point of failure:** if Harbor is down, the nodes pull from the
+   original registry directly, as today.
 4. **Independent of Docker Hub's rate limits** as far as possible, with optional
    Docker Hub credentials.
 
@@ -22,18 +24,27 @@
 
 Checked on 2026-09-19 against the running Harbor and cluster:
 
-- **Harbor v2.15.2 has a `docker-hub` adapter** for registry endpoints (the list
-  also has `docker-registry`, `github-ghcr` and others, which is how further
-  registries would follow).
-- **Harbor can reach Docker Hub:** from the `harbor-core` container,
-  `https://registry-1.docker.io/v2/` answers `401` (the normal "authenticate
-  first") in 0.5 s.
+- **Harbor v2.15.2 reaches all five upstreams with the planned adapters.**
+  Harbor's own endpoint check (`POST /api/v2.0/registries/ping`, which creates
+  nothing) answered `200` for each:
+
+  | Upstream | Adapter | URL | Ping |
+  | --- | --- | --- | --- |
+  | Docker Hub | `docker-hub` | `https://hub.docker.com` | 200 |
+  | quay.io | `docker-registry` | `https://quay.io` | 200 |
+  | ghcr.io | `github-ghcr` | `https://ghcr.io` | 200 |
+  | registry.k8s.io | `docker-registry` | `https://registry.k8s.io` | 200 |
+  | public.ecr.aws | `docker-registry` | `https://public.ecr.aws` | 200 |
+
+  A ping proves reachability, not a full proxied pull (token exchanges,
+  registry.k8s.io's redirects to its storage backends); Step 4 pulls an image
+  through each mirror.
 - **Harbor has no proxy cache yet:** no registry endpoints, and its only project
   is `library`, an ordinary one.
 - **The nodes run containerd v2.3.4 with `config_path = "/etc/containerd/certs.d"`**
   (set in `cluster/cluster-config.yaml` for update-setup-02). Today that
-  directory holds only `harbor.kind.local:3443`, so `docker.io` pulls go to
-  Docker Hub.
+  directory holds only `harbor.kind.local:3443`, so every other pull goes to the
+  internet.
 - **What the cluster pulls, by registry** (images on the three nodes):
 
   | Registry | Images | Examples |
@@ -44,55 +55,87 @@ Checked on 2026-09-19 against the running Harbor and cluster:
   | `ghcr.io` | 2 | ESO, Dex |
   | `public.ecr.aws` | 1 | Argo CD's Redis |
 
-  A Docker Hub mirror covers about a third; *Later* shows how the rest follows.
+## The mirrors
+
+One proxy-cache project per upstream, named after it, and one containerd
+directory per upstream on every node:
+
+| Upstream | Harbor endpoint (adapter) | Proxy project | Node config | Fallback `server` |
+| --- | --- | --- | --- | --- |
+| Docker Hub | `docker-hub` | `dockerhub` | `certs.d/docker.io/` | `https://registry-1.docker.io` |
+| quay.io | `docker-registry` | `quay` | `certs.d/quay.io/` | `https://quay.io` |
+| ghcr.io | `github-ghcr` | `ghcr` | `certs.d/ghcr.io/` | `https://ghcr.io` |
+| registry.k8s.io | `docker-registry` | `registry-k8s` | `certs.d/registry.k8s.io/` | `https://registry.k8s.io` |
+| public.ecr.aws | `docker-registry` | `ecr-public` | `certs.d/public.ecr.aws/` | `https://public.ecr.aws` |
+
+This table is also a file, **`registry/mirrors.tsv`**, read by both scripts
+below — Harbor's side and the nodes' side cannot drift apart:
+
+```
+# upstream          adapter          url                        project        fallback
+docker.io           docker-hub       https://hub.docker.com     dockerhub      https://registry-1.docker.io
+quay.io             docker-registry  https://quay.io            quay           https://quay.io
+ghcr.io             github-ghcr      https://ghcr.io            ghcr           https://ghcr.io
+registry.k8s.io     docker-registry  https://registry.k8s.io    registry-k8s   https://registry.k8s.io
+public.ecr.aws      docker-registry  https://public.ecr.aws     ecr-public     https://public.ecr.aws
+```
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    pod["Pod: image nginx:1.27<br/>(name unchanged)"]
+    pod["Pod: quay.io/argoproj/argocd:v3.5.3<br/>(name unchanged)"]
     subgraph node["kind node"]
-        cd["containerd<br/>certs.d/docker.io/hosts.toml"]
+        cd["containerd<br/>certs.d/&lt;upstream&gt;/hosts.toml"]
     end
     subgraph harbor["Harbor (host)"]
-        proj["project dockerhub<br/>proxy cache"]
+        proj["proxy project per upstream<br/>dockerhub, quay, ghcr, registry-k8s, ecr-public"]
         cache[("cached layers<br/>and manifests")]
     end
-    hub["Docker Hub<br/>registry-1.docker.io"]
+    up["the original registry"]
 
     pod --> cd
-    cd -->|"1. mirror: harbor.kind.local:3443/v2/dockerhub/..."| proj
+    cd -->|"1. mirror: harbor.kind.local:3443/v2/quay/argoproj/argocd"| proj
     proj --> cache
-    proj -->|"on a miss: fetch and keep"| hub
-    cd -.->|"2. fallback, if Harbor fails"| hub
+    proj -->|"on a miss: fetch and keep"| up
+    cd -.->|"2. fallback, if Harbor fails"| up
 ```
 
-- containerd rewrites a `docker.io` pull such as `library/nginx:1.27` to
-  `https://harbor.kind.local:3443/v2/dockerhub/library/nginx/...`
-  (`override_path = true`). Harbor's proxy project `dockerhub` answers from its
-  cache, or fetches from Docker Hub once and keeps a copy.
+- containerd rewrites a pull such as `quay.io/argoproj/argocd:v3.5.3` to
+  `https://harbor.kind.local:3443/v2/quay/argoproj/argocd/...`
+  (`override_path = true`). Harbor's proxy project answers from its cache, or
+  fetches from the upstream once and keeps a copy.
+- Docker Hub's official images work the same way: `nginx:1.27` is
+  `docker.io/library/nginx`, which becomes `dockerhub/library/nginx` in Harbor.
 - If Harbor does not answer, containerd falls back to the `server` in the same
-  file — Docker Hub itself.
+  file — the original registry.
+- Images already on a node are not pulled at all; that includes what the kind
+  node image preloads (most of `registry.k8s.io`). The mirror serves every pull
+  that does happen.
 
 ## Decisions
 
-- **A Harbor proxy-cache project, `dockerhub`,** backed by a `docker-hub`
-  registry endpoint. It is Harbor's built-in feature for exactly this, and the
-  cache lives on the host, so it survives `cluster/cluster.sh down`.
+- **Harbor proxy-cache projects, one per upstream,** named after it. It is
+  Harbor's built-in feature for exactly this, and the cache lives on the host, so
+  it survives `cluster/cluster.sh down`.
+- **All five registries at once,** not Docker Hub alone: the mechanism is the
+  same for each, and the other four supply two thirds of the cluster's images.
+- **One table drives both sides.** `registry/mirrors.tsv` is read by the Harbor
+  script and by `registry/kind-trust.sh`, so adding a sixth registry is one line.
 - **Transparent mirroring through containerd,** not rewritten image names.
   Rewriting would touch every chart and manifest and break upstream defaults; a
-  `hosts.toml` for `docker.io` changes nothing else.
-- **Docker Hub stays the fallback.** The `server` line in `hosts.toml` keeps pulls
-  working when Harbor is stopped — which the README recommends when memory is
-  tight.
-- **The project is public,** so the nodes pull without credentials, like from
-  `library`. Anyone who reaches Harbor could pull through it; on this host that
-  is only the host and the cluster.
-- **Anonymous upstream by default, credentials optional.** Harbor then pulls
-  from Docker Hub as this host's IP, exactly as the nodes do today — no worse,
-  and far fewer pulls. A Docker Hub access token, if provided, lifts the
-  anonymous rate limit; it is read from `registry/out/dockerhub-credentials` and
-  never enters git.
+  `hosts.toml` per upstream changes nothing else.
+- **The original registry stays the fallback.** The `server` line in each
+  `hosts.toml` keeps pulls working when Harbor is stopped — which the README
+  recommends when memory is tight.
+- **The projects are public,** so the nodes pull without credentials, like from
+  `library`. Anyone who reaches Harbor could pull through them; on this host
+  that is only the host and the cluster.
+- **Anonymous upstreams, with optional Docker Hub credentials.** Harbor pulls as
+  this host's IP, exactly as the nodes do today — no worse, and far fewer pulls.
+  Only Docker Hub rate-limits anonymous pulls noticeably; a Docker Hub access
+  token, if provided, is read from `registry/out/dockerhub-credentials`
+  (`user:token`, mode 600) and never enters git.
 - **Configured by a script through Harbor's API** (`registry/proxy-cache.sh`),
   like the OIDC settings (`registry/oidc-setup.sh`). Harbor also has a Terraform
   provider; one script per Harbor concern keeps `registry/` consistent. The
@@ -100,15 +143,20 @@ flowchart LR
   idempotent.
 - **The node side belongs in `registry/kind-trust.sh`,** which already writes
   Harbor's own `hosts.toml` after every `cluster.sh up`.
-- **Docker Hub only, for now.** The other registries follow the same pattern
-  (see *Later*); the host's own Docker is not changed (see *Known limitations*).
+- **The host's own Docker is not changed** (see *Known limitations*).
 
-## Step 1: The proxy cache in Harbor
+## Step 1: `registry/mirrors.tsv`
+
+The table above, as a file: whitespace-separated columns, `#` comments. Adding a
+registry later means adding a line and re-running both scripts.
+
+## Step 2: The proxy caches in Harbor
 
 `registry/proxy-cache.sh`, idempotent, through Harbor's API with the local admin
-(in the style of `registry/oidc-setup.sh`, including its wait for Harbor):
+(in the style of `registry/oidc-setup.sh`, including its wait for Harbor). For
+every line of `mirrors.tsv`:
 
-1. **Registry endpoint** `dockerhub` — create it unless it exists:
+1. **Registry endpoint** named after the project — create it unless it exists:
 
    ```json
    POST /api/v2.0/registries
@@ -121,11 +169,11 @@ flowchart LR
    }
    ```
 
-   The `credential` block only when `registry/out/dockerhub-credentials` exists
-   (`user:token`, mode 600). Then `POST /api/v2.0/registries/ping` with the
-   endpoint's id must succeed — that is Harbor reaching Docker Hub.
+   The `credential` block only for Docker Hub, and only when
+   `registry/out/dockerhub-credentials` exists. Then
+   `POST /api/v2.0/registries/ping` with the endpoint's id must succeed.
 
-2. **Proxy-cache project** `dockerhub` — create it unless it exists:
+2. **Proxy-cache project** — create it unless it exists:
 
    ```json
    POST /api/v2.0/projects
@@ -137,126 +185,129 @@ flowchart LR
    }
    ```
 
-3. **Print the result:** the endpoint's status (`healthy`) and the project's
-   `registry_id`.
+3. **Print the result:** one line per upstream — endpoint status (`healthy`) and
+   the project's `registry_id`.
 
-## Step 2: containerd on the nodes
+## Step 3: containerd on the nodes
 
-`registry/kind-trust.sh` gains a second `hosts.toml` per node:
+`registry/kind-trust.sh` writes, for every line of `mirrors.tsv` whose project
+exists in Harbor (it asks Harbor), a `hosts.toml` on every node:
 
 ```toml
-# /etc/containerd/certs.d/docker.io/hosts.toml
-server = "https://registry-1.docker.io"          # the fallback: Docker Hub itself
+# /etc/containerd/certs.d/quay.io/hosts.toml
+server = "https://quay.io"                          # the fallback: the original registry
 
-[host."https://harbor.kind.local:3443/v2/dockerhub"]
+[host."https://harbor.kind.local:3443/v2/quay"]
   capabilities = ["pull", "resolve"]
   ca = "/etc/containerd/certs.d/harbor.kind.local:3443/ca.crt"
-  override_path = true                           # the path already contains /v2/dockerhub
+  override_path = true                              # the path already contains /v2/quay
 ```
 
 - `harbor.kind.local` already resolves on the nodes (their `/etc/hosts`, written
   by the same script), and the CA file is the one the script already copies.
 - containerd reads `certs.d` on every pull: **no restart**, and existing pods are
   untouched.
-- Official images keep working: containerd asks for `library/nginx`, which
-  becomes `dockerhub/library/nginx` in Harbor and `library/nginx` upstream.
+- Only mirrors whose project exists get a file, so a Harbor without the proxy
+  caches does not send pulls on a detour.
 
-The file is written only when the `dockerhub` project exists (the script asks
-Harbor), so a Harbor without the proxy cache does not send every pull on a
-detour.
-
-## Step 3: Wiring
+## Step 4: Wiring
 
 - `registry/proxy-cache.sh` runs once after `registry/setup-host.sh`, and again
-  only to change credentials.
+  after a change to `mirrors.tsv` or to the credentials.
 - `registry/kind-trust.sh` runs after every `cluster/cluster.sh up`, as before —
-  it now writes both files.
-- README: the *Registry* section gains the mirror, how to add Docker Hub
-  credentials, and how to see what Harbor has cached.
+  it now writes one file per mirror as well.
+- README: the *Registry* section gains the mirrors, how to add Docker Hub
+  credentials and further registries, and how to see what Harbor has cached.
 
-## Step 4: Verification
+## Step 5: Verification
 
 **Harbor side:**
 
 ```bash
 registry/proxy-cache.sh      # twice: the second run changes nothing
-# endpoint "dockerhub" healthy, project "dockerhub" with a registry_id
+# five endpoints healthy, five proxy projects with a registry_id
 ```
 
-**A pull goes through Harbor, with the image name unchanged** — an image the
-cluster does not have yet:
+**One pull through each mirror, with the image name unchanged** — images the
+nodes do not have yet, for example (confirm the tags exist when implementing):
+
+| Upstream | Test image |
+| --- | --- |
+| Docker Hub | `docker.io/library/alpine:3.22` |
+| quay.io | `quay.io/prometheus/busybox:latest` |
+| ghcr.io | `ghcr.io/stefanprodan/podinfo` (a current tag) |
+| registry.k8s.io | `registry.k8s.io/pause:3.9` (the node image has 3.10) |
+| public.ecr.aws | `public.ecr.aws/docker/library/alpine:3.22` |
 
 ```bash
-docker exec dev-worker crictl pull docker.io/library/alpine:3.22
-curl -s -u "admin:$PW" https://harbor.kind.local:3443/api/v2.0/projects/dockerhub/repositories
-# -> dockerhub/library/alpine appears
+docker exec dev-worker crictl pull <image>
+curl -s -u "admin:$PW" https://harbor.kind.local:3443/api/v2.0/projects/<project>/repositories
+# -> the repository appears in the matching proxy project
 ```
 
-**The second pull is served from the cache:** remove the image from one node and
-pull it on another (or the same) node again; Harbor's artifact `pull_time`
-advances, and the pull is faster. Timing both pulls gives the number for the
-implementation notes.
+This is where each upstream's token exchange and, for registry.k8s.io, its
+redirects to storage are proven.
+
+**The second pull is served from the cache:** remove an image from one node and
+pull it again; Harbor's artifact `pull_time` advances, and the pull is faster.
+Timing both pulls gives the numbers for the implementation notes.
 
 **Pods are unaffected:** `kubectl run mirror-test --image=alpine:3.22 ... -- sleep
 60` runs, with the image name unchanged.
 
 **The fallback works:** stop Harbor
 (`docker compose -f registry/out/harbor/docker-compose.yml stop`), pull an image
-the nodes do not have — it must still succeed, directly from Docker Hub — then
-start Harbor again.
+the nodes do not have — it must still succeed, from the original registry —
+then start Harbor again.
 
-**A real workload through the mirror:** remove Grafana's image from its node and
-restart the Deployment; the image comes back through `dockerhub`.
+**Real workloads through the mirrors:** remove the images of one workload per
+registry from its node (Grafana for Docker Hub, Argo CD for quay.io, ESO for
+ghcr.io, Argo CD's Redis for public.ecr.aws) and restart them; each image comes
+back through its proxy project.
 
-## Step 5: Documentation
+## Step 6: Documentation
 
-- `architecture.md`: the *Registry* section and its diagram gain the proxy cache
+- `architecture.md`: the *Registry* section and its diagram gain the proxy caches
   and the fallback; the C4 relation "Pulls images" from the cluster to Harbor
-  covers Docker Hub images too; **ADR-0025** below.
-- README: as in Step 3.
+  covers all upstreams; **ADR-0025** below.
+- README: as in Step 4.
 - This file: status, implementation notes and evidence, as for the earlier
   plans.
 
 ## Planned ADR
 
-**ADR-0025: Harbor as a transparent pull-through cache for Docker Hub.**
-Context: every cluster rebuild pulls the same Docker Hub images again, subject to
-Docker Hub's rate limits and availability, although Harbor already runs on the
-host. Decision: a proxy-cache project `dockerhub` in Harbor, used by the nodes
-through a containerd `hosts.toml` for `docker.io` with `override_path`, Docker
-Hub itself as the fallback, image names unchanged, optional Docker Hub
-credentials kept out of git. Consequences: repeat pulls come from the host and
-survive cluster rebuilds; no chart or manifest changes; Harbor is on the pull
+**ADR-0025: Harbor as a transparent pull-through cache for every upstream
+registry.** Context: every cluster rebuild pulls the same images again from five
+registries, subject to their availability and to Docker Hub's rate limits,
+although Harbor already runs on the host. Decision: one proxy-cache project in
+Harbor per upstream (Docker Hub, quay.io, ghcr.io, registry.k8s.io,
+public.ecr.aws), used by the nodes through a containerd `hosts.toml` per upstream
+with `override_path`, the original registry as the fallback, image names
+unchanged, one table (`registry/mirrors.tsv`) driving both sides, optional Docker
+Hub credentials kept out of git. Consequences: repeat pulls come from the host
+and survive cluster rebuilds; no chart or manifest changes; Harbor is on the pull
 path but not a single point of failure; the first pull of each image still goes
-to Docker Hub; the host's own Docker is not covered.
+upstream; the host's own Docker is not covered.
 
 ## Known limitations and open points
 
-- **The first pull still goes to Docker Hub.** The mirror pays off from the
-  second pull on — which is exactly the cluster-rebuild case.
-- **Tags are checked upstream.** For a tag, Harbor asks Docker Hub whether it
+- **The first pull still goes upstream.** The mirrors pay off from the second
+  pull on — which is exactly the cluster-rebuild case.
+- **Preloaded images are not pulled.** The kind node image carries most of
+  `registry.k8s.io` already; its mirror serves whatever is not preloaded.
+- **Tags are checked upstream.** For a tag, Harbor asks the upstream whether it
   changed; pulls by digest are served from the cache alone. **To verify:**
-  Harbor's documented behaviour of serving the cached copy when Docker Hub is
+  Harbor's documented behaviour of serving the cached copy when the upstream is
   unreachable.
 - **Cache size.** Cached images take space in Harbor's data volume on the host.
   **To verify:** the retention Harbor applies to proxy-cache projects by default
   (reported as removing artifacts not pulled for 7 days); if absent, a tag
-  retention rule is the next step.
-- **Only `docker.io`.** 13 of the cluster's ~36 images; see *Later*.
+  retention rule per project is the next step.
 - **The host's Docker is not covered.** Harbor, Keycloak, Vault and the test
-  containers are pulled by the host's Docker, which would need `registry-mirrors`
-  in `/etc/docker/daemon.json` — sudo and a Docker restart, `docker.io` only.
+  containers are pulled by the host's Docker, whose `registry-mirrors` setting
+  in `/etc/docker/daemon.json` works for Docker Hub only and needs sudo and a
+  Docker restart.
 - **Anonymous rate limits still apply to Harbor's own upstream pulls** unless
-  credentials are configured — but Harbor makes far fewer of them.
-
-## Later
-
-The same two pieces — a proxy project in Harbor and a `hosts.toml` on the nodes
-— for the other registries:
-
-| Registry | Harbor adapter | Images today |
-| --- | --- | --- |
-| `quay.io` | `docker-registry` (`https://quay.io`) | 9 |
-| `ghcr.io` | `github-ghcr` | 2 |
-| `registry.k8s.io` | `docker-registry` | 11, mostly preloaded in the node image |
-| `public.ecr.aws` | `docker-registry` | 1 |
+  Docker Hub credentials are configured — but Harbor makes far fewer of them.
+- **Five public projects** can be pulled through by anything that reaches
+  Harbor; acceptable on this host.
