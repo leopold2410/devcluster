@@ -9,12 +9,23 @@ A local multi-node Kubernetes cluster on [kind](https://kind.sigs.k8s.io/)
 - the External Secrets Operator (ESO) and Argo CD;
 - containerized k9s and lazydocker;
 - TopoLVM for node-local block storage, backed by LVM on the host;
-- Harbor as a local registry, in Docker Compose next to the cluster.
+- Harbor as a local registry, in Docker Compose next to the cluster;
+- Keycloak as the central login for every UI, in Docker Compose;
+- metrics, logs and traces: the OpenTelemetry Collector, Prometheus, Loki, Tempo
+  and Grafana;
+- HashiCorp Vault for secrets, in Docker Compose, read by the cluster through
+  ESO.
 
-Set up with [`update-setup-01.md`](update-setup-01.md), applied and verified on
-2026-09-15, and [`update-setup-02.md`](update-setup-02.md) (storage and
-registry), applied and verified on 2026-09-16. It replaced the 2023 kind + MetalLB + Traefik setup (kept on git
-history: commit `ada2a79`).
+Built up step by step, each plan applied and verified:
+[`update-setup-01.md`](update-setup-01.md) (platform, 2026-09-15),
+[`update-setup-02.md`](update-setup-02.md) (storage and registry, 2026-09-16),
+[`update-setup-03.md`](update-setup-03.md) (Keycloak, 2026-09-17),
+[`update-setup-05.md`](update-setup-05.md) (observability, 2026-09-18) and
+[`update-setup-06.md`](update-setup-06.md) (Vault, 2026-09-18);
+[`update-setup-04.md`](update-setup-04.md) (OIDC for the API server) is
+postponed. The design and its decisions are in
+[`architecture.md`](architecture.md). This replaced the 2023 kind + MetalLB +
+Traefik setup (kept in git history: commit `ada2a79`).
 
 ## Quick start
 
@@ -62,6 +73,8 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 ├── storage/              # host side of TopoLVM: loop device, volume group, lvmd systemd units
 ├── registry/             # Harbor via Docker Compose; out/ is generated (git-ignored)
 ├── identity/             # Keycloak via Docker Compose; the realm is code in realm/localdev.yaml
+├── vault/                # Vault via Docker Compose; config/ is its Terraform project
+├── tests/                # Playwright browser suites for the Keycloak logins
 ├── applications/         # one folder per test application, each with its own deploy.sh
 │   ├── deploy.sh             # deploys the default ones (testapp)
 │   ├── testapp/  testhelm/
@@ -600,6 +613,50 @@ Worth knowing on this host: container metrics come from the kubelet's cAdvisor
 endpoint, because its summary API fails on ZFS; and host metrics show the host
 machine for every node, because kind's nodes share its kernel.
 
+## Vault (`vault/`)
+
+A secrets store the cluster consumes, running on the host like Keycloak and
+Harbor (`architecture.md`: *Secrets*, ADR-0023 and ADR-0024).
+
+```bash
+vault/setup-host.sh     # start, initialize once, unseal, apply the Terraform config
+                        # - re-run after every Vault restart: it comes back sealed
+vault/tf.sh plan        # Terraform for vault/config, in a container
+cluster/host-services-dns.sh   # after every cluster.sh up: pods resolve vault.kind.local
+./hosts.sh              # adds vault.kind.local for the browser
+```
+
+- **Log in** at https://vault.kind.local:8200: choose the *OIDC* method and sign
+  in; Keycloak opens in a popup. `dev` gets policy `admin` through
+  `platform-admins`. The root token, used by Terraform, is in
+  `vault/out/root-token`.
+- **Secrets live under `secret/`** (KV v2). Write one and use it in any
+  namespace through the cluster-wide store `vault`:
+
+  ```yaml
+  apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata: { name: my-secret, namespace: my-app }
+  spec:
+    refreshInterval: 30s
+    secretStoreRef: { kind: ClusterSecretStore, name: vault }
+    target: { name: my-secret }
+    data:
+      - secretKey: password
+        remoteRef: { key: my-app/db, property: password }   # secret/my-app/db
+  ```
+
+  `applications/vault-demo/deploy.sh` does exactly this for the test secret
+  `demo/hello` that Terraform seeds.
+- **How the cluster logs in:** ESO uses service account `vault-auth` in
+  `external-secrets`, bound to `system:auth-delegator`, because Vault checks each
+  login through the TokenReview API with that same token and stores no reviewer
+  token of its own.
+- **After a restart** Vault is sealed: ESO stops syncing, existing Secrets keep
+  their values, and `vault/setup-host.sh` unseals it.
+- **After a new cluster** re-run `vault/setup-host.sh`: it exports the new
+  cluster's CA and Terraform updates the Kubernetes auth.
+
 ## Browser smoke tests (`tests/`)
 
 The OIDC logins are the part `curl` cannot check: the login button, Keycloak's
@@ -613,11 +670,14 @@ tests/run.sh specs/argocd.spec.ts
 tests/run.sh --headed                  # watch it (needs an X server reachable from the container)
 ```
 
-One suite per service — `specs/argocd.spec.ts`, `specs/harbor.spec.ts` and
-`specs/grafana.spec.ts`, with the shared Keycloak form handling in
-`specs/support.ts`. The Grafana suite runs only when monitoring is deployed
-(`run.sh` looks for its Ingress), and also asserts that all three data sources
-pass Grafana's own health check.
+One suite per service — `specs/argocd.spec.ts`, `specs/harbor.spec.ts`,
+`specs/grafana.spec.ts` and `specs/vault.spec.ts`, with the shared Keycloak form
+handling in `specs/support.ts`. The Grafana suite runs only when monitoring is
+deployed (`run.sh` looks for its Ingress) and also asserts that all three data
+sources pass Grafana's own health check. The Vault suite runs once Vault is set
+up; it follows Vault's OIDC popup and asks Vault which policies the resulting
+token carries. `run.sh` checks Vault's `/v1/sys/health` first, which fails while
+Vault is sealed.
 
 Playwright runs in a container on the `kind` network, with the host names
 resolved to where the services actually are: `argocd.kind.local` to the

@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-18 |
-| Status | **Planned, not yet applied** |
+| Status | **Applied and verified on 2026-09-18.** Both points the plan could not verify held: Vault runs as the host user with host-owned data, and the Kubernetes login works with the client's own JWT and the default audience. See *Implementation notes*; where the steps below differ, the files in `vault/`, `platformservices/external-secrets/vault/` and `applications/vault-demo/` are authoritative |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) (ESO, trust-manager), [`update-setup-03.md`](update-setup-03.md) (Keycloak) and the local PKI |
 
 ## Goals
@@ -587,15 +587,57 @@ kubectl apply -k platformservices/external-secrets/vault      # restores it
   narrowly scoped service account, and tokens must keep the API server's
   audience.
 
+## Implementation notes
+
+The plan held, with no deviation in design. Details that differ from the steps
+above:
+
+- **`vault/.env` is generated** (mode 600) with the kind gateway address and the
+  host user's uid and gid. Compose does not see bash's `UID`, which bash does not
+  export, and hardcoding `172.21.0.1` would tie the files to this machine. The
+  gateway is also used for an `extra_hosts` entry for `keycloak.kind.local`, so
+  Vault's OIDC discovery does not depend on the host's `/etc/hosts`.
+- **The certificate also names `localhost`,** so the `vault` CLI inside the
+  container (`VAULT_ADDR=https://localhost:8200`) can verify it; `localhost` is
+  within the root CA's permitted names.
+- **`vault/tf.sh` resolves `vault.kind.local` with `--add-host`** to the gateway
+  and runs as the host user with `HOME=/tmp`, so Terraform does not depend on the
+  host's `/etc/hosts` and its state and provider cache stay owned by the user.
+- **Terraform seeds the test secret and then ignores its value**
+  (`lifecycle { ignore_changes = [data_json] }`). Otherwise every rotation made in
+  Vault — the Step 7 test included — would be reverted by the next `apply`, and
+  `plan` would never report "no changes".
+- **The CoreDNS script moved** to `cluster/host-services-dns.sh`, as planned. It
+  marks its `hosts` block, replaces it (also the unmarked block the old script
+  wrote), and restarts CoreDNS only when the block changed.
+- **`vault-demo` is not a default application,** since it needs Vault; it is
+  deployed from its own folder, like the other optional ones.
+- **The store is applied right after ESO** in `platformservices/deploy.sh`, only
+  when `vault/out/root-token` exists, and the script waits for it to be Ready.
+
+Verification evidence (2026-09-18):
+
+```
+vault        runs as 1000:1000, data files leo:leo; Initialized true, Sealed false,
+             Storage Type file, Version 2.1.1; TLS verified with the real CA
+terraform    11 resources applied; the OIDC auth method was accepted, so Vault reached
+             Keycloak over TLS; a second plan: "No changes" (exit 0)
+config       auth methods kubernetes/, oidc/, token/; secret/ is kv v2;
+             kubernetes host https://dev-control-plane:6443, no reviewer JWT stored
+store        ClusterSecretStore vault: Ready, "store validated"
+sync         vault-demo/hello: SecretSynced, greeting "hello from vault"
+rotation     a new value in Vault reached the Kubernetes Secret after 3 s
+negative     without the auth-delegator binding:
+             PUT /v1/auth/kubernetes/login -> 403 permission denied; recovers when restored
+restart      Vault restarted sealed: sync fails, the Secret keeps its last value;
+             setup-host.sh unseals, store Valid again, Terraform "No changes"
+browser      5 of 5 suites: Argo CD (twice), Grafana, Harbor, Vault
+             (OIDC popup; token carries identity policy admin)
+deploy.sh    full run exit 0, the store applied after ESO and Ready
+```
+
 ## Known limitations and open points
 
-- **Unverified: the whole login chain end to end** — TokenReview with the
-  client's JWT, the default audience, and ESO's token request. All are
-  documented behaviours; Step 7 is where they are proven, including the negative
-  test.
-- **Unverified: Vault as uid 1000** with a host-owned data directory; the
-  image's entrypoint normally changes ownership as root. The fallback is the
-  default user with a directory owned by the container's uid.
 - **Manual unseal.** Every Vault restart — a host reboot included — leaves it
   sealed until `vault/setup-host.sh` runs; ESO reports the store as not ready in
   between.

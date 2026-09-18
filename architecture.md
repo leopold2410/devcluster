@@ -46,10 +46,12 @@ C4Container
         ContainerDb(vg, "Volume group topolvm-vg", "LVM on a loop-backed file", "Backing store of all node volumes")
         Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA")
         Container(keycloak, "Keycloak", "Docker Compose: keycloak + PostgreSQL, port 8443", "Central identity provider standing in for a company IdP; realm localdev as code")
+        ContainerDb(vault, "Vault", "Docker Compose, file storage, port 8200; also on the kind network", "Secrets store; configured by Terraform in vault/config")
         ContainerDb(pki, "Local PKI", "OpenSSL files in pki/out", "Root CA plus intermediates for cert-manager, the Istio mesh and the host-side services")
     }
 
     System_Boundary(cluster, "kind cluster dev (Kubernetes 1.36)") {
+        Container(apiserver, "Kubernetes API server", "dev-control-plane:6443", "Also answers Vault's TokenReview calls")
         Container_Boundary(platform, "Platform services (platformservices/)") {
             Container(istio, "Istio", "istiod + ingress gateway", "Second ingress path and the service mesh; mTLS from the local root")
             Container(certmgr, "cert-manager", "ClusterIssuer kind-ca", "Issues certificates for Ingresses and services")
@@ -105,6 +107,12 @@ C4Container
     Rel(grafana, tempo, "Queries", "TraceQL")
     Rel(grafana, keycloak, "Login", "OIDC")
     Rel(dev, grafana, "Explores telemetry", "HTTPS via Ingress")
+
+    Rel(dev, vault, "Manages secrets, UI and CLI", "HTTPS, OIDC login")
+    Rel(vault, keycloak, "Login for people", "OIDC")
+    Rel(eso, vault, "Logs in as vault-auth, reads secret/", "HTTPS, Kubernetes auth")
+    Rel(vault, apiserver, "Reviews the login token", "TokenReview, on the kind network")
+    Rel(vault, pki, "Server certificate from the issuing CA", "files in vault/out/tls")
 ```
 
 ## Storage
@@ -235,6 +243,50 @@ flowchart LR
   no IP and are not verified; and host metrics describe the **host machine**,
   because kind's nodes share its kernel.
 
+## Secrets
+
+Vault runs on the host, next to Keycloak and Harbor, and the cluster only
+consumes it (update-setup-06, ADR-0023 and ADR-0024). People log in through
+Keycloak; the cluster logs in with a service account.
+
+```mermaid
+sequenceDiagram
+    participant ESO as ESO (external-secrets)
+    participant API as API server
+    participant V as Vault
+    ESO->>API: TokenRequest for service account vault-auth
+    API-->>ESO: short-lived JWT (default audience)
+    ESO->>V: login to auth/kubernetes, role external-secrets, with the JWT
+    V->>API: TokenReview of the JWT, authenticated with that same JWT
+    API-->>V: valid: system:serviceaccount:external-secrets:vault-auth
+    V-->>ESO: Vault token with policy eso-read
+    ESO->>V: read secret/data/demo/hello
+    ESO->>ESO: write Secret hello in namespace vault-demo
+```
+
+- **Vault stores no reviewer token.** It checks each login by calling
+  TokenReview with the token it was given, so `vault-auth` is bound to
+  `system:auth-delegator` — its only permission. Without that binding, Vault
+  answers the login with `403 permission denied` (verified). The token keeps the
+  API server's default audience, because it authenticates that call too.
+- **Vault reaches the API server on the `kind` network,** as
+  `dev-control-plane:6443`. kind publishes the API server only on the host's
+  loopback at a random port, which a container cannot reach.
+- **Configuration is code:** `vault/config` is a Terraform project (run in a
+  container, local state out of git) for the KV v2 engine at `secret/`, the
+  policies, the OIDC login and the Kubernetes auth. It seeds the test secret and
+  then leaves its value to Vault.
+- **Storage and unsealing:** file storage and one unseal key, kept in
+  `vault/out/` next to the data — a dev-only shortcut. Every start leaves Vault
+  sealed until `vault/setup-host.sh` runs; meanwhile ESO cannot sync, but
+  existing Kubernetes Secrets keep their last value.
+- **Names:** `vault.kind.local` is the kind gateway, for the browser through
+  `./hosts.sh` and for the pods through `cluster/host-services-dns.sh`.
+- **Using it:** a `ClusterSecretStore` named `vault` serves the whole cluster;
+  an `ExternalSecret` references a path under `secret/`. A change in Vault
+  reaches the Kubernetes Secret within the refresh interval (3 s in the test,
+  30 s at most).
+
 ## Identities and roles
 
 Two parallel paths lead into every service: identities from Keycloak, and local
@@ -252,11 +304,13 @@ flowchart LR
         argo["Argo CD<br/>argocd-rbac-cm"]
         harbor["Harbor<br/>oidc_admin_group"]
         grafana["Grafana<br/>role_attribute_path"]
+        vault["Vault<br/>external identity group"]
     end
     subgraph local["Local accounts (break-glass)"]
         la["argocd admin"]
         lh["harbor admin"]
         lg["grafana admin"]
+        lv["vault root token"]
         lk["keycloak admin (master realm)"]
     end
 
@@ -268,6 +322,8 @@ flowchart LR
     la -.->|"form login, bypasses the IdP"| argo
     lh -.->|"always_sso_login=false"| harbor
     lg -.->|"login form"| grafana
+    ga -->|"groups claim -> policy admin"| vault
+    lv -.->|"Terraform, bootstrap"| vault
     lk -.->|"administers the realm"| kc
 ```
 
@@ -287,14 +343,18 @@ Every password is generated, never committed: `identity/out/` and
 | Client `harbor` | Confidential OIDC client | `identity/out/harbor-client-secret`, stored in Harbor's configuration |
 | Client `grafana` | Confidential OIDC client, PKCE | `identity/out/grafana-client-secret`, copied into Secret `grafana-oidc` in namespace `monitoring` |
 | PostgreSQL | Keycloak's database | `identity/out/db-password` |
+| Root token (Vault) | Everything in Vault; used by Terraform | `vault/out/root-token` (also in `vault/out/init.json`) |
+| Unseal key (Vault) | Unseals Vault after every start | `vault/out/unseal-key` |
+| Client `vault` | Confidential OIDC client | `identity/out/vault-client-secret`; also in Vault's `oidc` auth method and in `vault/config/terraform.tfstate` |
+| ServiceAccount `vault-auth` | ESO's login to Vault; bound to `system:auth-delegator` | nothing stored: short-lived tokens through TokenRequest |
 
 ### How group membership becomes rights
 
-| Group | Argo CD | Harbor | Grafana |
-| --- | --- | --- | --- |
-| `platform-admins` | `policy.csv: g, platform-admins, role:admin` | `oidc_admin_group`, reported as `admin_role_in_auth: true` | `GrafanaAdmin`: server admin and organisation Admin |
-| `platform-users` | covered by `policy.default: role:readonly` | ordinary user, projects assigned per project | `Editor` |
-| no group | `role:readonly` | ordinary user | `Viewer` |
+| Group | Argo CD | Harbor | Grafana | Vault |
+| --- | --- | --- | --- | --- |
+| `platform-admins` | `policy.csv: g, platform-admins, role:admin` | `oidc_admin_group`, reported as `admin_role_in_auth: true` | `GrafanaAdmin`: server admin and organisation Admin | policy `admin`, through the external group of that name |
+| `platform-users` | covered by `policy.default: role:readonly` | ordinary user, projects assigned per project | `Editor` | policy `default` |
+| no group | `role:readonly` | ordinary user | `Viewer` | policy `default` |
 
 Four details that cost time to learn, so they are recorded here:
 
@@ -736,3 +796,52 @@ availability; the data lives and dies with the cluster. The charts come from a
 community repository, whose releases need watching. Tempo's chart keeps an
 unused Jaeger receiver: its Service template requires the block, and kustomize
 drops the `null` that would remove it.
+
+## ADR-0023: Vault outside the cluster, file storage, configured by Terraform
+
+**Date:** 2026-09-18 · **Status:** Accepted
+
+**Context.** Application secrets need a store the cluster consumes but does not
+own, like the identity provider: one that exists before the cluster and
+survives a rebuild. The External Secrets Operator is already installed.
+
+**Decision.** Vault 2.1.1 in Docker Compose on the host, with file storage and a
+single unseal key, running as the host user. A Terraform project in
+`vault/config` — Terraform 1.16.3 in a container, provider 5.12.0, local state
+kept out of git — configures the KV v2 engine, the policies, the OIDC login with
+Keycloak and the Kubernetes auth. Vault joins the `kind` network as a second
+network, because a container can reach the API server only there
+(`dev-control-plane:6443`); kind publishes it on the host's loopback only, at a
+random port. Taking kubectl's route instead — host networking plus a pinned API
+server port — was considered and rejected: it needs a recreated cluster and
+still depends on the `kind` network for the pods.
+
+**Consequences.** The configuration is code and can be rebuilt; secrets outlive
+the cluster. Every start leaves Vault sealed until `vault/setup-host.sh` runs,
+and the unseal key lives beside the data — acceptable only for a dev cluster.
+The Terraform state holds secrets, and Terraform uses the root token; a
+narrower token is the next hardening step. Vault depends on the `kind` network
+existing when it starts. Vault is under the Business Source License; OpenBao is
+the open-source alternative with the same API.
+
+## ADR-0024: Kubernetes auth without a stored reviewer token
+
+**Date:** 2026-09-18 · **Status:** Accepted
+
+**Context.** Vault's Kubernetes auth checks a service-account token by calling
+the TokenReview API. Vault can do that with a long-lived reviewer token stored
+in its configuration, or with the token of the client that is logging in.
+
+**Decision.** No reviewer token in Vault (`token_reviewer_jwt` unset,
+`disable_local_ca_jwt = true`). ESO logs in as a dedicated service account,
+`vault-auth` in `external-secrets`, whose only permission is
+`system:auth-delegator`; Vault's role `external-secrets` binds exactly that name
+and namespace and grants policy `eso-read`. Neither the role nor the store sets a
+custom audience.
+
+**Consequences.** Nothing long-lived to store, rotate or leak; ESO's tokens are
+short-lived and requested per login. The permission is visibly load-bearing:
+without the binding, Vault answers the login with `403 permission denied`
+(verified), and it recovers when the binding returns. The token must keep the
+API server's default audience, because it also authenticates the TokenReview
+call — a Vault-only audience would be rejected by the API server first.
