@@ -149,6 +149,80 @@ flowchart LR
   image tag.
 - **Privileges:** only `prepare` needs root; running Harbor does not.
 
+## Identities and roles
+
+Two parallel paths lead into every service: identities from Keycloak, and local
+break-glass accounts that Keycloak knows nothing about.
+
+```mermaid
+flowchart LR
+    subgraph kc["Keycloak realm localdev"]
+        dev["User dev"]
+        ga["Group platform-admins"]
+        gu["Group platform-users"]
+        dev --> ga
+    end
+    subgraph svc["Services"]
+        argo["Argo CD<br/>argocd-rbac-cm"]
+        harbor["Harbor<br/>oidc_admin_group"]
+    end
+    subgraph local["Local accounts (break-glass)"]
+        la["argocd admin"]
+        lh["harbor admin"]
+        lk["keycloak admin (master realm)"]
+    end
+
+    ga -->|"groups claim -> role:admin"| argo
+    ga -->|"groups claim -> admin_role_in_auth"| harbor
+    gu -->|"everyone else: role:readonly"| argo
+    la -.->|"form login, bypasses the IdP"| argo
+    lh -.->|"always_sso_login=false"| harbor
+    lk -.->|"administers the realm"| kc
+```
+
+### Where the credentials live
+
+Every password is generated, never committed: `identity/out/` and
+`registry/out/` are git-ignored, and `identity/.env` is mode 600.
+
+| Identity | Scope | Password / secret |
+| --- | --- | --- |
+| `dev` | Realm user, member of `platform-admins`; the account for daily use | `identity/out/dev-password` |
+| `admin` (Keycloak) | `master` realm, administers `localdev` | `identity/out/admin-password` |
+| `admin` (Argo CD) | Local account, form login only | Secret `argocd-secret` in namespace `argocd`; the first password is in Secret `argocd-initial-admin-secret` |
+| `admin` (Harbor) | Local account, `/account/sign-in?always_sso_login=false` | `harbor_admin_password` in `registry/out/harbor/harbor.yml` |
+| Client `argocd` | Confidential OIDC client | `identity/out/argocd-client-secret`, copied into `argocd-secret` as `oidc.keycloak.clientSecret` |
+| Client `harbor` | Confidential OIDC client | `identity/out/harbor-client-secret`, stored in Harbor's configuration |
+| PostgreSQL | Keycloak's database | `identity/out/db-password` |
+
+### How group membership becomes rights
+
+| Group | Argo CD | Harbor |
+| --- | --- | --- |
+| `platform-admins` | `policy.csv: g, platform-admins, role:admin` | `oidc_admin_group`, reported as `admin_role_in_auth: true` |
+| `platform-users` | covered by `policy.default: role:readonly` | ordinary user, projects assigned per project |
+| no group | `role:readonly` | ordinary user |
+
+Three details that cost time to learn, so they are recorded here:
+
+- **Argo CD identifies users by the `email` claim,** so the session username is
+  `dev@kind.local`, while Harbor onboards `preferred_username`, i.e. `dev`.
+- **Harbor leaves `sysadmin_flag` false for OIDC admins.** That column is for
+  locally promoted admins; rights from `oidc_admin_group` are evaluated per
+  session and reported as `admin_role_in_auth`.
+- **Harbor's OIDC users need the CLI secret** from their profile for
+  `docker login`, not their Keycloak password.
+
+### Why the local accounts stay
+
+They are the only way back in when the identity path breaks, and during this
+setup it broke four times: a rejected `return_url`, a `Secure` state cookie that
+a plain-http page never stores, a realm import that failed on an unknown client
+scope, and a callback rejected with `invalid_scope`. Each one would have locked
+both services out. Disabling Argo CD's local admin (`admin.enabled: "false"`) is
+a hardening step for when the OIDC path has proven itself; Harbor's fallback is
+worth keeping regardless, because a lockout there also stops image pulls.
+
 ---
 
 # Architecture decisions
