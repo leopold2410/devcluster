@@ -48,6 +48,11 @@ and accepted by the real binary:
   in Step 5, then `otelcol-k8s validate` on the rendered config: exit 0 (with a
   stand-in service account; without one it stops only at the pod-only paths
   `/hostfs`, `/var/lib/otelcol` and the service-account certificate).
+- **The send queues survive a restart.** `sending_queue: { storage: file_storage }`
+  on each exporter validates, and the chart already keeps `file_storage` at
+  `/var/lib/otelcol` as a **hostPath** on the node (it holds the log checkpoints),
+  so the queue outlives the pod — not the node. The DaemonSet rolls out with
+  `RollingUpdate`, one node at a time, with a 30 s termination grace period.
 - **In DaemonSet mode the chart adds leader election for `k8s_cluster` itself**
   (`k8s_leader_elector/k8s_cluster`), so cluster-level metrics are collected once,
   not once per node.
@@ -173,6 +178,12 @@ additionally collects the cluster-wide signals.
   graph come from Tempo, which sees every span. A gateway is added when tail
   sampling, central filtering or redaction, or an export outside the cluster
   arrives; the node collectors then forward to it.
+- **Persistent send queues.** Each exporter queues on disk (`file_storage`, the
+  hostPath the log checkpoints already use) instead of in memory. Data the
+  collector has accepted then survives a crash or an out-of-memory kill, and a
+  backend restart no longer loses what was waiting for it. What no queue can
+  cover is data a service pushes while its node's collector is not running; SDK
+  retries bridge the few seconds of a restart.
 - **OTLP end to end.** Collector → Prometheus (`/api/v1/otlp`), Loki (`/otlp`)
   and Tempo, all OTLP. Prometheus keeps its remote-write receiver as well,
   because Tempo's metrics generator writes span metrics that way.
@@ -474,17 +485,26 @@ helmCharts:
           objects:
             - { name: events, mode: watch }
       exporters:
+        # Queues on disk, not in memory: accepted data survives a collector crash
+        # and waits out a backend restart. file_storage is the node hostPath the
+        # log checkpoints already use.
         otlp_http/prometheus:
           endpoint: http://prometheus-server.monitoring.svc/api/v1/otlp
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
         otlp_http/loki:
           endpoint: http://loki.monitoring.svc:3100/otlp
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
         otlp_grpc/tempo:
           endpoint: tempo.monitoring.svc:4317
           tls: { insecure: true }
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
       service:
         extensions:
           - health_check
-          - file_storage                   # checkpoints for logsCollection
+          - file_storage                   # log checkpoints and the send queues
           - k8s_observer                   # annotation discovery
           - k8s_leader_elector/k8s_cluster # added by the clusterMetrics preset
           - k8s_leader_elector/k8s_objects
@@ -768,6 +788,18 @@ q 'count(k8s_node_condition_ready)'                   # 3, not 9: leader electio
 q 'prometheus_http_requests_total{handler=~"/api/v1/(otlp|write).*"}'
 ```
 
+**A collector restart loses no logs and no queued data:**
+
+```bash
+# Stop Loki, let the collectors queue for a minute, restart one collector, bring Loki back.
+kubectl -n monitoring scale statefulset loki --replicas=0
+node=dev-worker; pod=$(kubectl -n monitoring get pod -l app.kubernetes.io/name=opentelemetry-collector \
+  --field-selector spec.nodeName=$node -o name)
+kubectl -n monitoring delete $pod                       # its queue is on the node, not in the pod
+kubectl -n monitoring scale statefulset loki --replicas=1
+# Then in Grafana: the logs from pods on $node show no gap across the outage.
+```
+
 **Exemplars, logs and traces** (after some traffic to `testapp-mesh.kind.local`):
 
 ```bash
@@ -792,10 +824,19 @@ service graph shows the mesh.
 
 ## Known limitations and open points
 
-- **`internalTrafficPolicy: Local` has no fallback.** While a node's collector
-  restarts, telemetry sent from pods on that node is dropped rather than routed
-  to another node; SDKs retry for a short while. Acceptable for a dev cluster;
-  the price of node-local routing.
+- **What a collector restart can lose.** `internalTrafficPolicy: Local` has no
+  fallback to another node, so it depends on where the data is at that moment:
+  - *pod log files* — nothing: the checkpoint resumes at the last read position;
+  - *pulled metrics* (kubelet, host, cluster, annotated pods) — a gap of an
+    interval or two; those samples were simply never taken;
+  - *accepted but not yet exported* — nothing: the send queues are on disk;
+  - *pushed by services while the collector is down* — at risk. SDK retries with
+    backoff usually bridge a restart of a few seconds; Envoy's spans in that
+    window are lost. Planned restarts are rolling and graceful, one node at a
+    time, so the exposure is mainly a crash, which the memory limiter guards
+    against.
+- **The queues outlive the pod, not the node.** They sit on the node's
+  `/var/lib/otelcol`; recreating the cluster discards whatever was still queued.
 - **Mesh clients: to be observed.** Pods with a sidecar reach the Service through
   Envoy, which picks endpoints itself. Whether Envoy honours
   `internalTrafficPolicy: Local` decides only locality, not correctness — every
@@ -843,6 +884,7 @@ a Keycloak client with roles from the groups claim. Consequences: vendor-neutral
 collection in plain YAML, one endpoint for every service and no cross-node hop,
 links between all three signals, at roughly 1.2–2 GiB of memory; OpenTelemetry
 metric names instead of the classic Prometheus ones, so dashboards are chosen for
-them; a node's telemetry pauses while its collector restarts; exemplars only for
-recent data; chart and collector image pinned together because the presets rely
+them; persistent send queues, so a collector restart loses no logs and no
+accepted data — only what services push during the seconds it is down;
+exemplars only for recent data; chart and collector image pinned together because the presets rely
 on name aliases; no high availability.
