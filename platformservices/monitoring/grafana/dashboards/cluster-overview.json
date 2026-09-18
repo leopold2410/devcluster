@@ -1,0 +1,69 @@
+{
+  "uid": "platform-cluster-overview",
+  "title": "Cluster overview",
+  "description": "Built for the metrics this cluster actually has (update-setup-05): OpenTelemetry k8s_cluster metrics, cAdvisor container metrics, and Loki logs. No kube-state-metrics or node-exporter series are assumed.",
+  "tags": ["platform", "kubernetes"],
+  "schemaVersion": 39,
+  "time": { "from": "now-3h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Nodes ready",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "sum(k8s_node_condition_ready)" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Running pods",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "count(k8s_pod_phase == 2)" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Pods not running (pending, failed, unknown)",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "count(k8s_pod_phase == 1 or k8s_pod_phase == 4 or k8s_pod_phase == 5) or vector(0)" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Containers with restarts",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "count(k8s_container_restarts > 0) or vector(0)" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU by namespace (cores)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [ { "refId": "A", "legendFormat": "{{k8s_namespace_name}}", "expr": "sum by (k8s_namespace_name) (rate(container_cpu_usage_seconds_total{container!=\"\"}[5m]))" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory by namespace (working set)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [ { "refId": "A", "legendFormat": "{{k8s_namespace_name}}", "expr": "sum by (k8s_namespace_name) (container_memory_working_set_bytes{container!=\"\"})" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Log lines per minute by namespace",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [ { "refId": "A", "legendFormat": "{{k8s_namespace_name}}", "expr": "sum by (k8s_namespace_name) (count_over_time({k8s_namespace_name=~\".+\"}[1m]))" } ]
+    },
+    {
+      "type": "table",
+      "title": "Container restarts",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "format": "table", "instant": true, "expr": "sum by (k8s_namespace_name, k8s_pod_name, k8s_container_name) (k8s_container_restarts) > 0" } ]
+    }
+  ]
+}

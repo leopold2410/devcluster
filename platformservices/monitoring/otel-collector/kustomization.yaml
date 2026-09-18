@@ -1,0 +1,226 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The OpenTelemetry Collector (update-setup-05, ADR-0019/0020): a DaemonSet, because pod logs
+# and host metrics exist only on each node, reached by every service and by Istio through one
+# Service whose internalTrafficPolicy: Local keeps traffic on the sender's node. No hostPort.
+# Cluster-wide receivers run on one pod at a time, through leader election.
+helmCharts:
+- name: opentelemetry-collector
+  repo: https://open-telemetry.github.io/opentelemetry-helm-charts
+  version: 0.173.1
+  releaseName: otel-collector
+  namespace: monitoring
+  valuesInline:
+    fullnameOverride: otel-collector       # Service: otel-collector.monitoring.svc
+    mode: daemonset
+    image:
+      repository: otel/opentelemetry-collector-k8s
+      tag: 0.160.0                         # pinned with the chart: the presets rely on name aliases
+    command:
+      name: otelcol-k8s
+    resources:
+      requests: { memory: 128Mi }
+      limits: { memory: 512Mi }
+    # Every node, the control plane included: etcd, the API server, the scheduler and the
+    # controller manager run there, and their logs are the ones most worth having.
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+    # The node's root filesystem, read-only, for the hostmetrics receiver (what the preset mounts).
+    extraVolumes:
+      - name: hostfs
+        hostPath: { path: / }
+    extraVolumeMounts:
+      - name: hostfs
+        mountPath: /hostfs
+        readOnly: true
+        mountPropagation: HostToContainer
+    # The kubelet's /metrics/* endpoints are authorized as nodes/metrics, which no preset grants.
+    clusterRole:
+      rules:
+        - apiGroups: [""]
+          resources: [nodes/metrics]
+          verbs: [get]
+
+    # The single endpoint. Not created in DaemonSet mode unless asked for; with it, the chart
+    # sets internalTrafficPolicy: Local.
+    service:
+      enabled: true
+
+    presets:
+      logsCollection:                      # file_log on /var/log/pods of this node
+        enabled: true
+        includeCollectorLogs: false
+        storeCheckpoints: true             # resume where it stopped after a restart
+      kubernetesAttributes: { enabled: true }   # namespace, pod, workload on every signal
+      # Not kubeletMetrics: its kubelet_stats receiver reads the kubelet's /stats/summary, which
+      # fails as a whole on this host (500, "cannot find filesystem info for device rpool/..."),
+      # the same ZFS limitation as ADR-0011. Container metrics come from /metrics/cadvisor
+      # instead, which does work - see receivers.prometheus/kubelet.
+      # Not hostMetrics either: the preset appends its receiver to the shared "metrics" pipeline,
+      # where the three nodes' series collide. The receiver and its host mount are defined below
+      # instead, in a pipeline of their own.
+      clusterMetrics: { enabled: true }         # k8s_cluster; the chart adds leader election in this mode
+      # Not the annotationDiscovery preset: it follows OpenTelemetry's own annotations
+      # (io.opentelemetry.discovery.metrics/*), while Istio and cert-manager annotate their pods
+      # with prometheus.io/*. Those are scraped by receivers.prometheus/pods below.
+
+    ports:
+      # Reached only through the Service: no hostPort on the nodes.
+      otlp: { hostPort: 0 }
+      otlp-http: { hostPort: 0 }
+      jaeger-compact: { enabled: false }
+      jaeger-thrift: { enabled: false }
+      jaeger-grpc: { enabled: false }
+      zipkin: { enabled: false }
+
+    config:
+      extensions:
+        # The events preset adds nothing in DaemonSet mode, so events come from k8s_objects -
+        # collected by one pod only, through its own Lease.
+        k8s_leader_elector/k8s_objects:
+          auth_type: serviceAccount
+          lease_name: otel-k8s-objects
+          lease_namespace: monitoring
+      receivers:
+        k8s_objects:
+          auth_type: serviceAccount
+          k8s_leader_elector: k8s_leader_elector/k8s_objects
+          objects:
+            - { name: events, mode: watch }
+        hostmetrics:
+          # The node itself. Scrapers are "{}", not the preset's "null": kustomize drops null
+          # values before Helm sees them, which would leave no scrapers at all.
+          collection_interval: 30s
+          root_path: /hostfs
+          scrapers:
+            cpu: {}
+            memory: {}
+            load: {}
+            network: {}
+            disk: {}
+            filesystem:
+              exclude_fs_types:
+                match_type: strict
+                fs_types: [autofs, binfmt_misc, bpf, cgroup2, configfs, debugfs, devpts, devtmpfs,
+                           fusectl, hugetlbfs, iso9660, mqueue, nsfs, overlay, proc, procfs, pstore,
+                           rpc_pipefs, securityfs, selinuxfs, squashfs, sysfs, tracefs]
+              exclude_mount_points:
+                match_type: regexp
+                mount_points: ["^/dev($|/)", "^/proc($|/)", "^/sys($|/)", "^/var/lib/docker($|/)",
+                               "^/var/lib/kubelet($|/)", "^/snap($|/)"]
+        prometheus/kubelet:
+          # Container CPU, memory and network from this node's kubelet (cAdvisor). Classic
+          # Prometheus names (container_cpu_usage_seconds_total, ...), which most Kubernetes
+          # dashboards expect; no filesystem series, because of ZFS.
+          config:
+            scrape_configs:
+              - job_name: kubelet-cadvisor
+                scrape_interval: 30s
+                scheme: https
+                metrics_path: /metrics/cadvisor
+                authorization:
+                  credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+                tls_config:
+                  # kind's kubelets serve a self-signed certificate from a per-node CA that
+                  # names only the node (DNS:dev-worker), no IP, so it cannot be verified. The
+                  # token still authenticates the call. Proper fix: kubelet serverTLSBootstrap,
+                  # so the cluster CA signs serving certificates - needs a new cluster.
+                  insecure_skip_verify: true
+                static_configs:
+                  - targets: ["${env:K8S_NODE_IP}:10250"]
+                relabel_configs:
+                  - target_label: k8s_node_name
+                    replacement: ${env:K8S_NODE_NAME}
+                # Keep cAdvisor's namespace/pod/container for the dashboards, and add the names
+                # the OTLP metrics carry, so queries join across both.
+                metric_relabel_configs:
+                  - source_labels: [namespace]
+                    target_label: k8s_namespace_name
+                  - source_labels: [pod]
+                    target_label: k8s_pod_name
+                  - source_labels: [container]
+                    target_label: k8s_container_name
+        prometheus/pods:
+          # Pods annotated prometheus.io/scrape - on this node only, so each collector scrapes
+          # its own and nothing is scraped twice.
+          config:
+            scrape_configs:
+              - job_name: kubernetes-pods
+                scrape_interval: 30s
+                kubernetes_sd_configs:
+                  - role: pod
+                    selectors:
+                      - role: pod
+                        field: spec.nodeName=${env:K8S_NODE_NAME}
+                relabel_configs:
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: "true"
+                  - source_labels: [__meta_kubernetes_pod_phase]
+                    action: drop
+                    regex: Pending|Succeeded|Failed
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                    action: replace
+                    regex: (.+)
+                    target_label: __metrics_path__
+                  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                    action: replace
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $$1:$$2          # $$ is a literal $ in collector config
+                    target_label: __address__
+                  # The same label names the OTLP metrics carry, so queries join across both.
+                  - source_labels: [__meta_kubernetes_namespace]
+                    target_label: k8s_namespace_name
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    target_label: k8s_pod_name
+      processors:
+        # host_metrics carries no node identity, so without this the three nodes' series
+        # collide into one (verified: system_cpu_load_average_1m had 1 series, no labels).
+        # Only in the host pipeline: in the shared one, the elected collector would stamp its
+        # own node onto cluster-wide metrics.
+        resource/node:
+          attributes:
+            - key: k8s.node.name
+              value: ${env:K8S_NODE_NAME}
+              action: upsert
+      exporters:
+        # Queues on disk, not in memory: accepted data survives a collector crash and waits out
+        # a backend restart. file_storage is the node hostPath the log checkpoints already use.
+        otlp_http/prometheus:
+          endpoint: http://prometheus-server.monitoring.svc/api/v1/otlp
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
+        otlp_http/loki:
+          endpoint: http://loki.monitoring.svc:3100/otlp
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
+        otlp_grpc/tempo:
+          endpoint: tempo.monitoring.svc:4317
+          tls: { insecure: true }
+          sending_queue: { enabled: true, storage: file_storage }
+          retry_on_failure: { enabled: true }
+      service:
+        extensions:
+          - health_check
+          - file_storage                   # log checkpoints and the send queues
+          - k8s_leader_elector/k8s_cluster # added by the clusterMetrics preset
+          - k8s_leader_elector/k8s_objects
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_grpc/tempo]
+          metrics:
+            receivers: [otlp, prometheus, prometheus/pods, prometheus/kubelet, k8s_cluster]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_http/prometheus]
+          metrics/host:
+            receivers: [hostmetrics]
+            processors: [memory_limiter, resource/node, batch]
+            exporters: [otlp_http/prometheus]
+          logs:
+            receivers: [otlp, file_log, k8s_objects]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_http/loki]

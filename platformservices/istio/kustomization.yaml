@@ -18,3 +18,12 @@ helmCharts:
   version: 1.31.0
   releaseName: istiod
   namespace: istio-system
+  valuesInline:
+    meshConfig:
+      # Spans go to the same Service every other workload uses (update-setup-05). Its
+      # internalTrafficPolicy: Local keeps them on the sidecar's own node.
+      extensionProviders:
+        - name: otel
+          opentelemetry:
+            service: otel-collector.monitoring.svc.cluster.local
+            port: 4317

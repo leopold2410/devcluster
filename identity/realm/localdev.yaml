@@ -69,6 +69,22 @@ clients:
     # and the callback then fails with "invalid_scope" - after the login, not before.
     optionalClientScopes: [offline_access]
 
+  - clientId: grafana                  # update-setup-05
+    name: Grafana
+    enabled: true
+    publicClient: false
+    standardFlowEnabled: true
+    directAccessGrantsEnabled: false
+    secret: $(env:GRAFANA_CLIENT_SECRET)
+    rootUrl: https://grafana.kind.local
+    redirectUris:
+      - https://grafana.kind.local/login/generic_oauth
+    webOrigins:
+      - https://grafana.kind.local
+    attributes:
+      pkce.code.challenge.method: S256
+    defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
+
 users:
   - username: dev
     enabled: true

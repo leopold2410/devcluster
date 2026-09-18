@@ -92,3 +92,24 @@ print(json.dumps({"data": {"url": "https://argocd.kind.local", "oidc.config": oi
 else
     echo "--- argocd: identity/out/argocd-client-secret missing, skipping the Keycloak wiring"
 fi
+
+# 6. Monitoring (update-setup-05): the backends first, then the collector that writes to them,
+# then Grafana. The collector DaemonSet is "otel-collector-agent": the chart appends "-agent"
+# in DaemonSet mode, while the Service keeps the plain name.
+apply monitoring/namespace
+apply monitoring/prometheus;      kubectl -n monitoring rollout status deployment/prometheus-server --timeout=300s
+apply monitoring/loki;            kubectl -n monitoring rollout status statefulset/loki --timeout=300s
+apply monitoring/tempo;           kubectl -n monitoring rollout status statefulset/tempo --timeout=300s
+apply monitoring/otel-collector;  kubectl -n monitoring rollout status daemonset/otel-collector-agent --timeout=300s
+# Grafana's local admin and its Keycloak client secret come from identity/out/ and never enter
+# git. Without identity/, Grafana still starts: a generated local admin, no Keycloak login.
+if [[ -f "$IDENTITY/grafana-admin-password" ]]; then
+    from_files kubectl -n monitoring create secret generic grafana-admin \
+        --from-literal=admin-user=admin --from-file=admin-password="$IDENTITY/grafana-admin-password"
+    from_files kubectl -n monitoring create secret generic grafana-oidc \
+        --from-file=client-secret="$IDENTITY/grafana-client-secret"
+elif ! kubectl -n monitoring get secret grafana-admin >/dev/null 2>&1; then
+    from_files kubectl -n monitoring create secret generic grafana-admin \
+        --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -base64 18)"
+fi
+apply monitoring/grafana;         kubectl -n monitoring rollout status deployment/grafana --timeout=300s

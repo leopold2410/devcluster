@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Prometheus as the metrics store (update-setup-05, ADR-0021): it stores and answers queries,
+# it does not collect. The OpenTelemetry Collector sends OTLP, Tempo remote-writes span metrics.
+helmCharts:
+- name: prometheus
+  repo: https://prometheus-community.github.io/helm-charts
+  version: 29.30.2
+  releaseName: prometheus
+  namespace: monitoring
+  valuesInline:
+    server:
+      extraFlags:
+        - web.enable-lifecycle             # the chart's default, kept for config reloads
+        - web.enable-otlp-receiver         # the collector sends OTLP to /api/v1/otlp
+        - web.enable-remote-write-receiver # Tempo's span metrics arrive via /api/v1/write
+        - enable-feature=exemplar-storage  # trace ids on samples, for metric -> trace links
+      otlp:
+        # Without this, resource attributes only exist in target_info, and no metric
+        # could be filtered by namespace, pod or node.
+        promote_resource_attributes:
+          - k8s.namespace.name
+          - k8s.pod.name
+          - k8s.node.name
+          - k8s.container.name
+          - k8s.deployment.name
+          - k8s.statefulset.name
+          - k8s.daemonset.name
+          - service.name
+      exemplars:
+        max_exemplars: 100000              # in-memory ring buffer; recent data only
+      retention: 15d
+      persistentVolume:
+        enabled: true
+        size: 15Gi
+        storageClass: topolvm
+      resources:
+        requests: { memory: 256Mi }
+        limits: { memory: 1Gi }
+      # strategy stays at the chart's default, Recreate: never two servers on one TSDB
+    # The collector does the collecting: Prometheus only scrapes itself. Every other default
+    # job would duplicate what the collector sends, with different labels.
+    scrapeConfigs:
+      kubernetes-api-servers: { enabled: false }
+      kubernetes-nodes: { enabled: false }
+      kubernetes-nodes-cadvisor: { enabled: false }
+      kubernetes-service-endpoints: { enabled: false }
+      kubernetes-service-endpoints-slow: { enabled: false }
+      prometheus-pushgateway: { enabled: false }
+      kubernetes-services: { enabled: false }
+      kubernetes-pods: { enabled: false }
+      kubernetes-pods-slow: { enabled: false }
+    alertmanager: { enabled: false }             # alerting is out of scope
+    kube-state-metrics: { enabled: false }       # the collector's k8s_cluster receiver covers it
+    prometheus-node-exporter: { enabled: false } # the collector's host_metrics receiver covers it
+    prometheus-pushgateway: { enabled: false }

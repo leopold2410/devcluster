@@ -27,6 +27,12 @@ ARGOCD_IP=$(kubectl -n argocd get ingress argocd-web -o jsonpath='{.status.loadB
 HOST_IP=$(docker network inspect kind -f '{{range .IPAM.Config}}{{if .Gateway}}{{.Gateway}} {{end}}{{end}}' |
     tr ' ' '\n' | grep -v ':' | head -1)
 [[ -n $HOST_IP ]] || { echo "could not determine the gateway of the kind network" >&2; exit 1; }
+# Grafana is optional: its suite runs when monitoring is deployed (update-setup-05).
+GRAFANA_IP=$(kubectl -n monitoring get ingress grafana -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+grafana_args=()
+if [[ -n $GRAFANA_IP ]]; then
+    grafana_args=(--add-host "grafana.kind.local:$GRAFANA_IP" -e GRAFANA_URL=https://grafana.kind.local)
+fi
 
 ARGOCD_URL="https://argocd.kind.local"
 HARBOR_URL="https://$HARBOR_HOSTNAME:$HARBOR_HTTPS_PORT"
@@ -42,12 +48,18 @@ for spec in "argocd.kind.local:443:$ARGOCD_IP|$ARGOCD_URL/" \
     printf '   %-60s ' "$url"
     curl -fsS -o /dev/null --cacert "$PKI/root-ca.crt" --resolve "$resolve" "$url" && echo OK
 done
+if [[ -n $GRAFANA_IP ]]; then
+    printf '   %-60s ' "https://grafana.kind.local/api/health"
+    curl -fsS -o /dev/null --cacert "$PKI/root-ca.crt" --resolve "grafana.kind.local:443:$GRAFANA_IP" \
+        https://grafana.kind.local/api/health && echo OK
+fi
 
 echo "== playwright"
 docker run --rm --init --network kind \
     --add-host "argocd.kind.local:$ARGOCD_IP" \
     --add-host "$KEYCLOAK_HOSTNAME:$HOST_IP" \
     --add-host "$HARBOR_HOSTNAME:$HOST_IP" \
+    "${grafana_args[@]}" \
     -e ARGOCD_URL="$ARGOCD_URL" \
     -e HARBOR_URL="$HARBOR_URL" \
     -e KEYCLOAK_REALM="$KEYCLOAK_REALM" \

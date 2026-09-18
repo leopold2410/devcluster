@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Loki, one process, filesystem storage on a TopoLVM volume (update-setup-05, ADR-0022).
+# From grafana-community: the chart in grafana/ is for Grafana Enterprise Logs only since 2026-03.
+helmCharts:
+- name: loki
+  repo: https://grafana-community.github.io/helm-charts
+  version: 18.13.3
+  releaseName: loki
+  namespace: monitoring
+  valuesInline:
+    deploymentMode: Monolithic
+    loki:
+      auth_enabled: false                # single tenant
+      commonConfig:
+        replication_factor: 1
+      storage:
+        type: filesystem
+      schemaConfig:
+        configs:
+          - from: "2026-09-18"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index: { prefix: loki_index_, period: 24h }
+      limits_config:
+        retention_period: 168h           # 7 days
+        allow_structured_metadata: true  # OTLP attributes that do not become labels
+      compactor:
+        retention_enabled: true
+        delete_request_store: filesystem
+    singleBinary:
+      replicas: 1
+      persistence:
+        enabled: true
+        size: 10Gi
+        storageClass: topolvm
+      resources:
+        requests: { memory: 256Mi }
+        limits: { memory: 768Mi }
+    # Everything a single-process Loki does not need on this host:
+    backend: { replicas: 0 }
+    read: { replicas: 0 }
+    write: { replicas: 0 }
+    chunksCache: { enabled: false }      # memcached would cost more than it saves here
+    resultsCache: { enabled: false }
+    lokiCanary: { enabled: false }
+    test: { enabled: false }
+    minio: { enabled: false }
+    gateway: { enabled: false }          # the collector and Grafana talk to Service loki directly

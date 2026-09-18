@@ -1,0 +1,148 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Grafana (update-setup-05): Prometheus, Loki and Tempo as linked data sources, login through
+# Keycloak (realm localdev, client grafana) with roles from the groups claim. The local admin
+# stays as break-glass. Secrets grafana-oidc and grafana-admin come from platformservices/deploy.sh.
+helmCharts:
+- name: grafana
+  repo: https://grafana-community.github.io/helm-charts
+  version: 13.2.5
+  releaseName: grafana
+  namespace: monitoring
+  valuesInline:
+    admin:
+      existingSecret: grafana-admin
+      userKey: admin-user
+      passwordKey: admin-password
+    deploymentStrategy:
+      type: Recreate                     # one SQLite volume: never two Grafanas on it
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClassName: topolvm
+    resources:
+      requests: { memory: 128Mi }
+      limits: { memory: 384Mi }
+
+    ingress:
+      enabled: true
+      ingressClassName: cloud-provider-kind
+      annotations:
+        cert-manager.io/cluster-issuer: kind-ca
+      hosts: [grafana.kind.local]
+      tls:
+        - hosts: [grafana.kind.local]
+          secretName: grafana-tls
+
+    # The token and userinfo calls go from Grafana's server to Keycloak, so it must trust the
+    # local root CA - the ConfigMap trust-manager puts into every namespace.
+    extraConfigmapMounts:
+      - name: kind-root-ca
+        mountPath: /etc/ssl/kind
+        configMap: kind-root-ca
+        readOnly: true
+    envValueFrom:
+      GRAFANA_OIDC_CLIENT_SECRET:
+        secretKeyRef:
+          name: grafana-oidc
+          key: client-secret
+          optional: true                 # without identity/ Grafana starts; only the Keycloak login fails
+
+    grafana.ini:
+      server:
+        # https, not http: the redirect URI is built from this, and the Argo CD detour showed
+        # what a scheme mismatch costs.
+        root_url: https://grafana.kind.local
+      auth:
+        disable_login_form: false          # the local admin stays reachable
+      auth.generic_oauth:
+        enabled: true
+        name: Keycloak
+        client_id: grafana
+        client_secret: $__env{GRAFANA_OIDC_CLIENT_SECRET}
+        scopes: openid profile email groups
+        auth_url: https://keycloak.kind.local:8443/realms/localdev/protocol/openid-connect/auth
+        token_url: https://keycloak.kind.local:8443/realms/localdev/protocol/openid-connect/token
+        api_url: https://keycloak.kind.local:8443/realms/localdev/protocol/openid-connect/userinfo
+        use_pkce: true
+        tls_client_ca: /etc/ssl/kind/ca.crt
+        login_attribute_path: preferred_username
+        email_attribute_path: email
+        # 'GrafanaAdmin' = server admin plus Admin of the org. allow_assign_grafana_admin only has
+        # an effect when this path returns 'GrafanaAdmin'; 'Admin' alone would stop at the org.
+        role_attribute_path: >-
+          contains(groups[*], 'platform-admins') && 'GrafanaAdmin' ||
+          contains(groups[*], 'platform-users') && 'Editor' || 'Viewer'
+        allow_assign_grafana_admin: true
+        role_attribute_strict: false       # no matching group -> Viewer, not locked out
+
+    datasources:
+      datasources.yaml:
+        apiVersion: 1
+        datasources:
+          - name: Prometheus
+            uid: prometheus
+            type: prometheus
+            url: http://prometheus-server.monitoring.svc
+            isDefault: true
+            jsonData:
+              exemplarTraceIdDestinations:          # metric -> trace
+                # "traceID" is the label Tempo's span metrics put on their exemplars (checked
+                # with /api/v1/query_exemplars); "trace_id" would silently never link.
+                - { name: traceID, datasourceUid: tempo }
+          - name: Loki
+            uid: loki
+            type: loki
+            url: http://loki.monitoring.svc:3100
+            jsonData:
+              derivedFields:                         # log -> trace, for ids written into the line
+                - name: traceID
+                  matcherRegex: '(?:traceID|trace_id|traceId)[=:"\s]+(\w+)'
+                  url: '$${__value.raw}'
+                  datasourceUid: tempo
+          - name: Tempo
+            uid: tempo
+            type: tempo
+            url: http://tempo.monitoring.svc:3200
+            jsonData:
+              tracesToLogsV2: { datasourceUid: loki, filterByTraceID: true }   # trace -> logs
+              tracesToMetrics: { datasourceUid: prometheus }                   # trace -> metrics
+              serviceMap: { datasourceUid: prometheus }                        # service graph
+              nodeGraph: { enabled: true }
+
+    dashboardProviders:
+      dashboardproviders.yaml:
+        apiVersion: 1
+        providers:
+          - name: platform
+            orgId: 1
+            folder: Platform
+            type: file
+            disableDeletion: true
+            editable: false
+            options: { path: /var/lib/grafana/dashboards/platform }
+          - name: istio
+            orgId: 1
+            folder: Istio
+            type: file
+            disableDeletion: true
+            editable: false
+            options: { path: /var/lib/grafana/dashboards/istio }
+    # The platform dashboards are files in this repository, turned into a ConfigMap below. Not
+    # "dashboards: ... file:", which the chart reads from inside its own package.
+    dashboardsConfigMaps:
+      platform: grafana-dashboards-platform
+    dashboards:
+      # Istio's official dashboards, pinned by revision so an upstream edit cannot change them.
+      istio:
+        istio-mesh:     { gnetId: 7639, revision: 330, datasource: Prometheus }
+        istio-service:  { gnetId: 7636, revision: 329, datasource: Prometheus }
+        istio-workload: { gnetId: 7630, revision: 330, datasource: Prometheus }
+
+configMapGenerator:
+- name: grafana-dashboards-platform
+  namespace: monitoring
+  files:
+  - dashboards/cluster-overview.json
+generatorOptions:
+  disableNameSuffixHash: true   # the chart refers to it by name; Grafana rescans the folder itself

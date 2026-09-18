@@ -1,0 +1,13 @@
+# Mesh-wide tracing through the "otel" provider defined in istiod's meshConfig (update-setup-05).
+# Every sidecar and gateway reports its spans; Tempo turns them into span metrics and the
+# service graph, which gives the mesh traces and metric -> trace links with no code changes.
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: otel
+      randomSamplingPercentage: 100   # a dev cluster: every request is interesting

@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Observability (update-setup-05): the OpenTelemetry Collector collects, Prometheus, Loki and
+# Tempo store, Grafana shows. Rendered as one tree for review; platformservices/deploy.sh
+# applies the parts in dependency order, backends first.
+resources:
+- namespace
+- prometheus
+- loki
+- tempo
+- otel-collector
+- grafana
