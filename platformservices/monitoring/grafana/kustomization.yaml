@@ -20,9 +20,12 @@ helmCharts:
       enabled: true
       size: 1Gi
       storageClassName: topolvm
+    # Measured: Grafana 13 sits at 300-380 Mi in normal use, and a dashboard loading all its
+    # panels at once pushed it past the first limit of 384 Mi - OOM-killed, which the browser
+    # showed as connection timeouts. ~2.6x the observed peak.
     resources:
-      requests: { memory: 128Mi }
-      limits: { memory: 384Mi }
+      requests: { memory: 384Mi }
+      limits: { memory: 1Gi }
 
     ingress:
       enabled: true

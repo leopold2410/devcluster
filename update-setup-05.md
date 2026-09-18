@@ -220,8 +220,13 @@ additionally collects the cluster-wide signals.
 | Prometheus | 1 | 256 Mi | 1 Gi | 15 Gi |
 | Loki | 1 | 256 Mi | 768 Mi | 10 Gi |
 | Tempo | 1 | 256 Mi | 768 Mi | 10 Gi |
-| Grafana | 1 | 128 Mi | 384 Mi | 1 Gi |
-| **Total** | **7** | **~1.25 Gi** | **~4.4 Gi** | **36 Gi** |
+| Grafana | 1 | 384 Mi | 1 Gi | 1 Gi |
+| **Total** | **7** | **~1.5 Gi** | **~5 Gi** | **36 Gi** |
+
+Measured after applying (peak working set): Prometheus 129 Mi, Loki 119 Mi,
+Tempo 82 Mi, each collector ≤ 109 Mi — and Grafana 452 Mi while all four
+dashboards load, which is why its figures were raised from the planned
+128 Mi / 384 Mi (see *Implementation notes*).
 
 Expected use is roughly 1.2–2 GiB against 5.9 GiB available. If memory gets
 tight, stop Harbor first. The 36 Gi of volumes leave ~16 GB of the volume group
@@ -1002,6 +1007,11 @@ the steps above in these points, each found on the running cluster:
   (`/api/v1/query_exemplars`). Grafana's `exemplarTraceIdDestinations` uses
   `traceID`; with the planned name, the metric → trace link would silently never
   have worked.
+- **Grafana needs more memory than planned.** Grafana 13 sits at 300–380 Mi in
+  normal use, and loading a dashboard with all its panels pushed it past the
+  planned 384 Mi limit: OOM-killed twice, which in the browser looked like
+  intermittent connection timeouts. Now 384 Mi requested and a 1 Gi limit;
+  replaying all four dashboards twice peaks at 452 Mi, with no restart.
 - **Grafana grants server admin only for `'GrafanaAdmin'`.** With
   `allow_assign_grafana_admin`, the planned `'Admin'` would have stopped at the
   organisation; the browser test asserts `isGrafanaAdmin`.
