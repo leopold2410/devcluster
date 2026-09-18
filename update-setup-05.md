@@ -1,161 +1,220 @@
-# Update setup 05: Observability with the Grafana stack — Mimir, Loki, Tempo, Grafana
+# Update setup 05: Observability — OpenTelemetry Collector, Prometheus, Loki, Tempo, Grafana
 
 | | |
 | --- | --- |
 | Date | 2026-09-18 |
-| Status | **Planned, not yet applied** |
+| Status | **Planned, not yet applied.** Revision 3: metrics in Prometheus instead of Mimir; collection by the OpenTelemetry Collector as a DaemonSet, reached through one node-local Service, instead of Grafana's `k8s-monitoring`/Alloy (see *Decisions*) |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) (platform services, cert-manager, trust-manager), [`update-setup-02.md`](update-setup-02.md) (TopoLVM) and [`update-setup-03.md`](update-setup-03.md) (Keycloak) |
 
 ## Goals
 
-1. **Metrics, logs and traces for the cluster and its workloads**, stored in
-   Mimir, Loki and Tempo and explored in Grafana.
-2. **All of it as platform services in a dedicated `monitoring` namespace,**
+1. **Metrics, logs and traces for the cluster and its workloads**, collected by
+   the OpenTelemetry Collector, stored in Prometheus, Loki and Tempo, explored in
+   Grafana.
+2. **One endpoint for every service:** `otel-collector.monitoring.svc`, which
+   always answers on the caller's own node.
+3. **All of it as platform services in a dedicated `monitoring` namespace,**
    rendered by Kustomize like every other part of `platformservices/`.
-3. **Grafana logs in through Keycloak,** with the same realm, groups and
+4. **Grafana logs in through Keycloak,** with the same realm, groups and
    break-glass pattern as Argo CD and Harbor.
-4. **Correlation, not three silos:** a trace links to its logs, a log line links
-   to its trace, and the service graph comes from the traces themselves.
-5. **Sized for this machine.** One host with ~5.9 GB of free memory, not a
-   production cluster.
+5. **Correlation, not three silos:** a metric links to the trace behind it, a
+   trace links to its logs and metrics, a log line links to its trace, and the
+   service graph comes from the traces themselves.
+6. **Sized for this machine.** One host with ~5.9 GB of free memory.
 
 ## What was verified before writing this
 
-Checked on 2026-09-18 against the chart repositories and this host:
+Checked on 2026-09-18 against the chart repositories, the released binaries and
+this host.
 
-- **Three charts changed repository.** `grafana`, `tempo` and
-  `tempo-distributed` are marked **deprecated** in `grafana/helm-charts` (last
-  release January 2026). Their maintained versions are in
-  **`grafana-community/helm-charts`** (`https://grafana-community.github.io/helm-charts`).
-- **Loki moved as well, less visibly.** Its chart in Grafana's repo is *not*
-  flagged deprecated, but its README says: *"As of March 16, 2026, the Grafana
-  Loki Helm chart for OSS users has moved to grafana-community/helm-charts … The
-  chart in this repository is now maintained for Grafana Enterprise Logs (GEL)
-  users only."* The two lines have diverged (7.3.0 vs 18.13.3), so picking the
-  wrong one would silently mean an enterprise-oriented chart.
-- **Mimir 3's chart enables Kafka by default.** `mimir-distributed` 6.2.0 turns
-  on `kafka`, `minio`, `rollout_operator`, `gateway` and about a dozen
-  microservices — Mimir's ingest-storage architecture. The chart has no
-  monolithic mode (no `deploymentMode` key).
-- **Tempo 3 still runs monolithic without Kafka.** From the chart's upgrade notes:
-  *"Monolithic mode still runs every component in one process and needs no
-  Kafka."* Tempo 3.0 removed the ingester and compactor; the `local_blocks`
-  metrics-generator processor is gone.
-- **Loki's community chart** defaults to `deploymentMode: Monolithic` (the old
-  name `SingleBinary` is deprecated).
-- **`k8s-monitoring` ships every feature disabled and no destinations**
-  (`destinations: {}`), so nothing is collected until configured.
-- **trust-manager already publishes the root CA** as ConfigMap `kind-root-ca`,
-  key `ca.crt`, in every namespace — Grafana can verify Keycloak with it.
-- **Istio's `istiod` chart has no `valuesInline` yet** in
-  `platformservices/istio/kustomization.yaml`, so mesh tracing is a new block.
-- **Host headroom:** 15 GiB RAM, **5.9 GiB available** with the cluster, Harbor
-  and Keycloak running. TopoLVM reports **~52.6 GB free** in the shared volume
-  group.
+**The collector** — its configuration in Step 5 was rendered from the real chart
+and accepted by the real binary:
+
+- **`opentelemetry-collector` chart 0.173.1, collector 0.160.0.** The chart leaves
+  `image.repository` and `mode` empty on purpose; both must be chosen.
+- **The Kubernetes distribution (`otel/opentelemetry-collector-k8s:0.160.0`) has
+  every component this needs** — `otlp`, `file_log`, `kubelet_stats`,
+  `host_metrics`, `k8s_cluster`, `k8s_objects`, `prometheus`, `receiver_creator`,
+  `k8s_attributes`, `otlp_grpc`, `otlp_http`, `k8s_observer`,
+  `k8s_leader_elector` — but **no `prometheusremotewrite` exporter** and **no
+  receiver that tails pod logs through the Kubernetes API**. Metrics therefore go
+  to Prometheus as OTLP, and pod logs can only be read from each node's
+  `/var/log/pods` — which is what makes a DaemonSet necessary.
+- **Component IDs were renamed to snake_case in 0.160** (`file_log`,
+  `k8s_attributes`, `otlp_grpc`, `otlp_http`, …). The chart's presets still emit
+  some old names (`hostmetrics`, `kubeletstats`), and the binary still accepts
+  them as aliases — so chart and image are pinned together.
+- **The final configuration validates.** `helm template` with exactly the values
+  in Step 5, then `otelcol-k8s validate` on the rendered config: exit 0 (with a
+  stand-in service account; without one it stops only at the pod-only paths
+  `/hostfs`, `/var/lib/otelcol` and the service-account certificate).
+- **In DaemonSet mode the chart adds leader election for `k8s_cluster` itself**
+  (`k8s_leader_elector/k8s_cluster`), so cluster-level metrics are collected once,
+  not once per node.
+- **The `kubernetesEvents` preset adds nothing in DaemonSet mode.** Events come
+  from `k8s_objects`, added by hand with its own leader election; `k8s_objects`
+  and `k8s_events` both accept a `k8s_leader_elector` (validated).
+- **The Service is the single endpoint, and it is node-local.** In DaemonSet mode
+  the chart creates no Service unless `service.enabled: true`; with it, Service
+  `otel-collector` gets `internalTrafficPolicy: Local` on 4317/4318.
+- **Host ports are removed.** The chart binds `hostPort` 4317 and 4318 by default;
+  with `hostPort: 0` the render has none. The chart's Jaeger and Zipkin ports,
+  also open by default, are disabled.
+- **The preset already associates data with the sending pod** in the right order
+  — the pod's IP attribute, then its UID, then the connection address — so no
+  override is needed.
+- **The rendered RBAC covers the plan:** leases (`coordination.k8s.io`) for
+  leader election, events, nodes, `nodes/stats`, pods, namespaces and workloads.
+
+**The backends:**
+
+- **Prometheus v3.14.0** has `--web.enable-otlp-receiver`, and started with
+  `--enable-feature=exemplar-storage --web.enable-remote-write-receiver` it logs
+  *"Experimental in-memory exemplar storage enabled"* and becomes ready. The
+  `native-histograms` feature flag is a no-op in 3.14.
+- **The `prometheus` chart (29.30.2)** enables `alertmanager`,
+  `kube-state-metrics`, `prometheus-node-exporter` and `prometheus-pushgateway`
+  by default and ships ten scrape jobs; it has `server.extraFlags`,
+  `server.exemplars`, `server.otlp` (`promote_resource_attributes`),
+  `server.retention`, `server.persistentVolume`, service port 80, and a
+  Deployment with `strategy: Recreate`.
+- **Charts moved:** `grafana`, `tempo` and `tempo-distributed` are deprecated in
+  `grafana/helm-charts`; the maintained ones are in `grafana-community`. Loki's
+  chart in `grafana/` is, per its README, *"now maintained for Grafana Enterprise
+  Logs (GEL) users only"*; the OSS line is `grafana-community/loki` 18.x.
+- **Tempo 3 runs monolithic without Kafka** (per its chart's upgrade notes); the
+  `local_blocks` processor is gone.
+
+**The platform:**
+
+- **No metrics store exists yet** — no Prometheus, no Prometheus Operator CRDs.
+  cert-manager, istiod, the Istio gateway and the `testapp-mesh` sidecars are
+  already annotated for scraping.
+- **trust-manager publishes the root CA** as ConfigMap `kind-root-ca`, key
+  `ca.crt`, in every namespace.
+- **Istio's `istiod` chart has no `valuesInline` yet.**
+- **Host headroom:** 15 GiB RAM, 5.9 GiB available; TopoLVM ~52.6 GB free.
 
 ## Versions
 
-| Component | Chart | Chart version | App version | Repository |
+| Component | Chart | Chart version | App / image | Repository |
 | --- | --- | --- | --- | --- |
+| OpenTelemetry Collector | `opentelemetry-collector` | **0.173.1** | `otel/opentelemetry-collector-k8s:0.160.0` | open-telemetry |
+| Prometheus | `prometheus` | **29.30.2** | v3.14.0 | prometheus-community |
 | Grafana | `grafana` | **13.2.5** | 13.2.2 | grafana-community |
 | Loki | `loki` | **18.13.3** | 3.7.8 | grafana-community |
 | Tempo | `tempo` (monolithic) | **3.0.0** | 3.0.3 | grafana-community |
-| Mimir | *no chart, see decisions* | — | 3.2.0 | image `grafana/mimir` |
-| Collection | `k8s-monitoring` | **4.5.2** | — | grafana |
-| ↳ kube-state-metrics | subchart | (8.5.0 upstream) | 2.20.0 | via k8s-monitoring |
-| ↳ node-exporter | subchart | (4.57.0 upstream) | 1.12.1 | via k8s-monitoring |
-
-Chart versions are pinned in each part's `kustomization.yaml`, as for every
-platform service; `versions.env` stays for host-side tools.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph sources["Sources"]
-        pods["Pod logs<br/>/var/log/pods"]
-        k8s["kubelet, cAdvisor,<br/>kube-state-metrics, node-exporter"]
-        mesh["Istio sidecars<br/>and gateway"]
-        apps["Instrumented apps<br/>(OTLP)"]
+    subgraph node["every node"]
+        app["App pod"]
+        side["Istio sidecar"]
+        logs["/var/log/pods"]
+        kubelet["kubelet"]
+        otel["OpenTelemetry Collector<br/>(DaemonSet pod)"]
     end
+    svc["Service otel-collector<br/>internalTrafficPolicy: Local"]
     subgraph mon["namespace monitoring"]
-        alloy["Alloy<br/>(k8s-monitoring)"]
+        prom["Prometheus<br/>store and query only"]
         loki["Loki<br/>monolithic"]
-        mimir["Mimir<br/>monolithic"]
         tempo["Tempo<br/>monolithic"]
         grafana["Grafana"]
     end
     kc["Keycloak<br/>(host)"]
 
-    pods --> alloy
-    k8s --> alloy
-    mesh -->|"metrics"| alloy
-    mesh -->|"spans, OTLP"| alloy
-    apps -->|"OTLP"| alloy
-    alloy -->|"push"| loki
-    alloy -->|"remote_write"| mimir
-    alloy -->|"OTLP"| tempo
-    tempo -->|"span metrics,<br/>service graph"| mimir
-    grafana --> loki & mimir & tempo
+    app -->|"OTLP"| svc
+    side -->|"spans"| svc
+    svc -->|"same node only"| otel
+    logs --> otel
+    kubelet --> otel
+    otel -->|"OTLP metrics"| prom
+    otel -->|"OTLP logs"| loki
+    otel -->|"OTLP traces"| tempo
+    tempo -->|"span metrics, service graph,<br/>remote write with exemplars"| prom
+    grafana --> prom & loki & tempo
     grafana -->|"OIDC"| kc
 ```
 
-Everything flows through Alloy: it adds the Kubernetes metadata (namespace, pod,
-workload) that makes the three signals joinable in Grafana.
+Every service sends to the same name, and the Service delivers each request to
+the collector on the sender's own node. That collector also reads the node's
+logs and kubelet, and adds the Kubernetes metadata (namespace, pod, workload)
+that makes the three signals joinable. One of the three, elected through a Lease,
+additionally collects the cluster-wide signals.
 
 ## Decisions
 
-- **Monolithic everywhere.** One process each for Loki, Tempo and Mimir. The
-  scalable modes are for throughput and availability this cluster does not need,
-  and their memory cost is exactly what this host lacks.
-- **Mimir runs from plain manifests, not from `mimir-distributed`.** The chart
-  has no monolithic mode, and its default of Kafka plus a dozen components would
-  not fit in the host's free memory. Mimir itself supports `-target=all` with
-  filesystem block storage, which is what runs here — a StatefulSet, a
-  ConfigMap and a Service in `platformservices/monitoring/mimir/`. The chart
-  remains the path if this ever needs to scale; see *Open points*.
-- **The classic write path, not ingest storage.** Mimir 3 defaults to the
-  Kafka-based architecture; the monolithic setup disables it
-  (`ingest_storage.enabled: false`) so no Kafka is needed.
-- **Charts from `grafana-community`** for Grafana, Loki and Tempo — the
-  maintained OSS line. The deprecated `grafana/` copies are not used, and Loki
-  deliberately not from `grafana/` either.
-- **Filesystem storage on TopoLVM volumes,** no object store. MinIO would add a
-  component whose only purpose is to be S3; local volumes survive pod restarts,
-  and the data does not need to outlive the cluster.
-- **`k8s-monitoring` as the collection layer.** It is Grafana's supported way to
-  wire Alloy, kube-state-metrics and node-exporter to self-hosted backends, and
-  it turns hundreds of lines of Alloy configuration into feature flags. The cost
-  is one more abstraction to debug through; the alternative is the `alloy` chart
-  with hand-written pipelines.
-- **Grafana logs in through Keycloak**, as a third client in the `localdev`
-  realm, with roles from the `groups` claim. The local admin stays as
-  break-glass, as for Argo CD and Harbor.
-- **No sidecar injection in `monitoring`.** The namespace is not labelled for
-  Istio: the telemetry stack must not depend on the mesh it observes.
-- **Retention sized to the disk:** Mimir 15 days, Loki 7 days, Tempo 72 hours.
+- **The OpenTelemetry Collector, not Grafana Alloy.** Alloy is Grafana's
+  distribution of the same OpenTelemetry components; nothing in the stack needs
+  it. The upstream collector is vendor-neutral, configured in plain YAML, and
+  what the rest of the OpenTelemetry ecosystem assumes.
+- **Not `k8s-monitoring`.** Grafana's assembler chart turns features into Alloy
+  configuration, but 4.x still requires defining collectors and assigning every
+  feature, and deploys no kube-state-metrics or node-exporter unless told to —
+  less turnkey than it looks, and Alloy-specific.
+- **A DaemonSet, because logs live on the nodes.** Pod logs are files in each
+  node's `/var/log/pods`, and the collector has no receiver that tails them
+  through the Kubernetes API; host metrics need the node's `/proc` and `/sys`.
+  Only a pod on every node can read those.
+- **One endpoint: the node-local Service.** Every service and Istio send OTLP to
+  `otel-collector.monitoring.svc:4317/4318`. With `internalTrafficPolicy: Local`,
+  the name always reaches the collector on the sender's own node — one address
+  for everyone, no cross-node hop.
+- **No `hostPort`.** It would add a second way in, reachable by anything that can
+  reach a node's address, and it is the path where a request can arrive with the
+  node's address instead of the pod's. Through the Service, the pod's own address
+  is kept, so the collector can tell which pod sent what.
+- **No gateway Deployment.** A single Service name is not a single processing
+  point: each node's collector handles its own share. That only matters for work
+  that needs every span of a trace in one place, and none is planned here —
+  cluster-wide receivers use leader election, and span metrics and the service
+  graph come from Tempo, which sees every span. A gateway is added when tail
+  sampling, central filtering or redaction, or an export outside the cluster
+  arrives; the node collectors then forward to it.
+- **OTLP end to end.** Collector → Prometheus (`/api/v1/otlp`), Loki (`/otlp`)
+  and Tempo, all OTLP. Prometheus keeps its remote-write receiver as well,
+  because Tempo's metrics generator writes span metrics that way.
+- **OpenTelemetry metric names for the infrastructure.** `kubelet_stats`,
+  `host_metrics` and `k8s_cluster` produce OpenTelemetry semantics
+  (`k8s_pod_cpu_usage`, `k8s_node_memory_usage`, …), not cAdvisor,
+  kube-state-metrics or node-exporter names. Dashboards are chosen accordingly.
+  Istio's and cert-manager's own metrics are scraped as Prometheus metrics and
+  keep their names, so Istio's dashboards apply unchanged.
+- **Prometheus promotes the Kubernetes resource attributes to labels.** By
+  default OTLP resource attributes land in a separate `target_info` series;
+  without promotion no metric could be filtered by namespace or pod.
+- **Prometheus, not Mimir, as the metrics store.** Mimir's strengths —
+  scale-out, long object-storage retention, multi-tenancy — do not apply to one
+  node; its current chart defaults to Kafka and a dozen components with no
+  monolithic mode. Grafana does not see a difference, and Mimir can be added
+  behind Prometheus later.
+- **Exemplars on, knowingly in memory.** `exemplar-storage` keeps trace ids on
+  samples; Prometheus holds them in a fixed buffer, so the links exist for recent
+  data only.
+- **Monolithic backends on TopoLVM volumes,** no object store; Grafana, Loki and
+  Tempo from `grafana-community`.
+- **Grafana logs in through Keycloak** as a third client in `localdev`.
+- **No sidecar injection in `monitoring`.** The telemetry stack must not depend
+  on the mesh it observes.
+- **Retention sized to the disk:** Prometheus 15 days, Loki 7 days, Tempo 72
+  hours.
 
 ## Resource budget
 
-Steady-state figures are estimates for this cluster's size; limits are what the
-manifests will set.
-
 | Component | Pods | Request | Limit | Volume |
 | --- | --- | --- | --- | --- |
-| Mimir | 1 | 256 Mi | 1 Gi | 15 Gi |
+| OpenTelemetry Collector (DaemonSet) | 3 | 128 Mi each | 512 Mi each | — |
+| Prometheus | 1 | 256 Mi | 1 Gi | 15 Gi |
 | Loki | 1 | 256 Mi | 768 Mi | 10 Gi |
 | Tempo | 1 | 256 Mi | 768 Mi | 10 Gi |
 | Grafana | 1 | 128 Mi | 384 Mi | 1 Gi |
-| Alloy, logs (DaemonSet) | 3 | 64 Mi each | 256 Mi each | — |
-| Alloy, metrics and OTLP receiver | 2 | 128 Mi each | 512 Mi each | — |
-| kube-state-metrics | 1 | 64 Mi | 128 Mi | — |
-| node-exporter | 3 | 16 Mi each | 64 Mi each | — |
-| **Total** | **13** | **~1.6 Gi** | **~4.9 Gi** | **36 Gi** |
+| **Total** | **7** | **~1.25 Gi** | **~4.4 Gi** | **36 Gi** |
 
-Expected use is 1.5–2.5 GiB against 5.9 GiB available — workable, not generous.
-If memory gets tight, Harbor is the first thing to stop
-(`docker compose -f registry/out/harbor/docker-compose.yml stop`). The 36 Gi of
-volumes leave ~16 GB of the volume group for everything else.
+Expected use is roughly 1.2–2 GiB against 5.9 GiB available. If memory gets
+tight, stop Harbor first. The 36 Gi of volumes leave ~16 GB of the volume group
+for everything else.
 
 ## Layout
 
@@ -163,11 +222,11 @@ volumes leave ~16 GB of the volume group for everything else.
 platformservices/monitoring/
 ├── kustomization.yaml          # aggregates the parts below
 ├── namespace.yaml              # monitoring, deliberately without istio-injection
-├── mimir/                      # plain manifests: ConfigMap, StatefulSet, Service
+├── otel-collector/             # helmCharts: open-telemetry/opentelemetry-collector (DaemonSet)
+├── prometheus/                 # helmCharts: prometheus-community/prometheus
 ├── loki/                       # helmCharts: grafana-community/loki
 ├── tempo/                      # helmCharts: grafana-community/tempo
-├── grafana/                    # helmCharts: grafana-community/grafana, Ingress, dashboards
-└── collection/                 # helmCharts: grafana/k8s-monitoring
+└── grafana/                    # helmCharts: grafana-community/grafana, Ingress, dashboards
 ```
 
 ## Step 1: Namespace
@@ -183,69 +242,70 @@ metadata:
   # when the mesh it observes does not.
 ```
 
-## Step 2: Mimir, monolithic
+## Step 2: Prometheus as the metrics store
 
-`platformservices/monitoring/mimir/config.yaml` — the Mimir configuration as a
-ConfigMap:
+`platformservices/monitoring/prometheus/kustomization.yaml`:
 
 ```yaml
-target: all
-multitenancy_enabled: false          # one tenant, "anonymous"; no X-Scope-OrgID needed
-
-server:
-  http_listen_port: 8080
-  grpc_listen_port: 9095
-
-ingest_storage:
-  enabled: false                     # Mimir 3 defaults to Kafka; the classic path needs none
-
-common:
-  storage:
-    backend: filesystem
-    filesystem:
-      dir: /data/blocks
-
-blocks_storage:
-  storage_prefix: blocks
-  tsdb:
-    dir: /data/tsdb
-
-compactor:
-  data_dir: /data/compactor
-  sharding_ring:
-    kvstore: { store: memberlist }
-
-limits:
-  compactor_blocks_retention_period: 15d
-  max_global_series_per_user: 500000
-
-ingester:
-  ring:
-    replication_factor: 1            # a single ingester
-    kvstore: { store: memberlist }
-
-store_gateway:
-  sharding_ring:
-    replication_factor: 1
-
-ruler_storage:
-  backend: filesystem
-  filesystem: { dir: /data/rules }
-
-alertmanager_storage:
-  backend: filesystem
-  filesystem: { dir: /data/alertmanager }
+helmCharts:
+- name: prometheus
+  repo: https://prometheus-community.github.io/helm-charts
+  version: 29.30.2
+  releaseName: prometheus
+  namespace: monitoring
+  valuesInline:
+    server:
+      extraFlags:
+        - web.enable-lifecycle             # the chart's default, kept for config reloads
+        - web.enable-otlp-receiver         # the collector sends OTLP to /api/v1/otlp
+        - web.enable-remote-write-receiver # Tempo's span metrics arrive via /api/v1/write
+        - enable-feature=exemplar-storage  # trace ids on samples, for metric -> trace links
+      otlp:
+        # Without this, resource attributes only exist in target_info, and no metric
+        # could be filtered by namespace, pod or node.
+        promote_resource_attributes:
+          - k8s.namespace.name
+          - k8s.pod.name
+          - k8s.node.name
+          - k8s.container.name
+          - k8s.deployment.name
+          - k8s.statefulset.name
+          - k8s.daemonset.name
+          - service.name
+      exemplars:
+        max_exemplars: 100000              # in-memory ring buffer; recent data only
+      retention: 15d
+      persistentVolume:
+        enabled: true
+        size: 15Gi
+        storageClass: topolvm
+      resources:
+        requests: { memory: 256Mi }
+        limits: { memory: 1Gi }
+      # strategy stays at the chart's default, Recreate: never two servers on one TSDB
+    # The collector does the collecting: Prometheus only scrapes itself.
+    scrapeConfigs:
+      kubernetes-api-servers: { enabled: false }
+      kubernetes-nodes: { enabled: false }
+      kubernetes-nodes-cadvisor: { enabled: false }
+      kubernetes-service-endpoints: { enabled: false }
+      kubernetes-service-endpoints-slow: { enabled: false }
+      prometheus-pushgateway: { enabled: false }
+      kubernetes-services: { enabled: false }
+      kubernetes-pods: { enabled: false }
+      kubernetes-pods-slow: { enabled: false }
+    alertmanager: { enabled: false }             # alerting is out of scope
+    kube-state-metrics: { enabled: false }       # the collector's k8s_cluster receiver covers it
+    prometheus-node-exporter: { enabled: false } # the collector's host_metrics receiver covers it
+    prometheus-pushgateway: { enabled: false }
 ```
 
-A StatefulSet with one replica runs `grafana/mimir:3.2.0` with
-`-config.file=/etc/mimir/mimir.yaml`, a `volumeClaimTemplate` of 15 Gi on
-StorageClass `topolvm` mounted at `/data`, and the limits from the budget. The
-Service `mimir` exposes 8080 (HTTP) and 9095 (gRPC); readiness is `/ready`.
+Endpoints:
 
-The endpoints the rest of the stack uses:
-
-- write: `http://mimir.monitoring.svc:8080/api/v1/push`
-- query (Prometheus API): `http://mimir.monitoring.svc:8080/prometheus`
+- OTLP from the collector: `http://prometheus-server.monitoring.svc/api/v1/otlp`
+  (the exporter appends `/v1/metrics`)
+- remote write from Tempo: `http://prometheus-server.monitoring.svc/api/v1/write`
+- query: `http://prometheus-server.monitoring.svc` (service port 80)
 
 ## Step 3: Loki, monolithic
 
@@ -275,6 +335,7 @@ helmCharts:
             index: { prefix: loki_index_, period: 24h }
       limits_config:
         retention_period: 168h       # 7 days
+        allow_structured_metadata: true   # OTLP attributes that do not become labels
       compactor:
         retention_enabled: true
         delete_request_store: filesystem
@@ -287,21 +348,22 @@ helmCharts:
       resources:
         requests: { memory: 256Mi }
         limits: { memory: 768Mi }
-    # Everything a monolithic Loki does not need on this host:
     backend: { replicas: 0 }
     read: { replicas: 0 }
     write: { replicas: 0 }
-    chunksCache: { enabled: false }  # memcached would cost more than it saves here
+    chunksCache: { enabled: false }
     resultsCache: { enabled: false }
     lokiCanary: { enabled: false }
     test: { enabled: false }
     minio: { enabled: false }
-    gateway: { enabled: false }      # Alloy and Grafana talk to the service directly
+    gateway: { enabled: false }
 ```
 
-Push endpoint for Alloy: `http://loki.monitoring.svc:3100/loki/api/v1/push`.
-The exact service name depends on the chart's naming in Monolithic mode; confirm
-it in the render before wiring Alloy and Grafana to it.
+OTLP endpoint for the collector: `http://loki.monitoring.svc:3100/otlp` (the
+exporter appends `/v1/logs`). Loki maps a default set of resource attributes —
+the common `k8s.*` ones and `service.name` — to index labels and keeps the rest
+as structured metadata; confirm which labels appear before building queries on
+them.
 
 ## Step 4: Tempo, monolithic
 
@@ -325,11 +387,11 @@ helmCharts:
           protocols:
             grpc: { endpoint: "0.0.0.0:4317" }
             http: { endpoint: "0.0.0.0:4318" }
-      # Service graph and span metrics, written to Mimir: Grafana draws the
-      # service map from these, without any extra instrumentation.
+      # Span metrics and the service graph, written to Prometheus with exemplars:
+      # this gives un-instrumented workloads metric -> trace links.
       metricsGenerator:
         enabled: true
-        remoteWriteUrl: http://mimir.monitoring.svc:8080/api/v1/push
+        remoteWriteUrl: http://prometheus-server.monitoring.svc/api/v1/write
       resources:
         requests: { memory: 256Mi }
         limits: { memory: 768Mi }
@@ -339,62 +401,127 @@ helmCharts:
       storageClassName: topolvm
 ```
 
-Tempo 3 dropped the `local_blocks` processor, so only the `service-graphs` and
-`span-metrics` processors are enabled. Check the value names against
+Tempo 3 dropped the `local_blocks` processor, so only `service-graphs` and
+`span-metrics` are enabled, and the remote write must send exemplars
+(`send_exemplars: true`). Check these value names against
 `helm show values tempo --version 3.0.0` — the chart was restructured for 3.0.
 
-## Step 5: Collection with k8s-monitoring
+## Step 5: The OpenTelemetry Collector as a DaemonSet
 
-`platformservices/monitoring/collection/kustomization.yaml`, the parts that
-matter:
+`platformservices/monitoring/otel-collector/kustomization.yaml`. These are exactly
+the values rendered and validated with `otelcol-k8s validate`, plus `resources`:
 
 ```yaml
 helmCharts:
-- name: k8s-monitoring
-  repo: https://grafana.github.io/helm-charts
-  version: 4.5.2
-  releaseName: k8s-monitoring
+- name: opentelemetry-collector
+  repo: https://open-telemetry.github.io/opentelemetry-helm-charts
+  version: 0.173.1
+  releaseName: otel-collector
   namespace: monitoring
-  includeCRDs: true
   valuesInline:
-    cluster:
-      name: kind-dev
-    destinations:
-      mimir:
-        type: prometheus
-        url: http://mimir.monitoring.svc:8080/api/v1/push
-      loki:
-        type: loki
-        url: http://loki.monitoring.svc:3100/loki/api/v1/push
-      tempo:
-        type: otlp
-        url: tempo.monitoring.svc:4317
-        protocol: grpc
-        tls: { insecure: true }
-        metrics: { enabled: false }
-        logs: { enabled: false }
-        traces: { enabled: true }
-    clusterMetrics:
-      enabled: true                    # kubelet, cAdvisor, kube-state-metrics, node-exporter
-    clusterEvents:
+    fullnameOverride: otel-collector       # Service: otel-collector.monitoring.svc
+    mode: daemonset                        # pod logs and host metrics only exist per node
+    image:
+      repository: otel/opentelemetry-collector-k8s
+      tag: 0.160.0                         # pinned with the chart: the presets rely on name aliases
+    command:
+      name: otelcol-k8s
+    resources:
+      requests: { memory: 128Mi }
+      limits: { memory: 512Mi }
+
+    # The single endpoint for every service and for Istio. Not created in
+    # DaemonSet mode unless asked for; with it, the chart sets
+    # internalTrafficPolicy: Local, so the name reaches the sender's own node.
+    service:
       enabled: true
-    podLogsViaLoki:
-      enabled: true                    # /var/log/pods from every node
-    annotationAutodiscovery:
-      enabled: true                    # prometheus.io/scrape annotations, incl. Istio's merged metrics
-    applicationObservability:
-      enabled: true                    # the OTLP receiver apps and the mesh send spans to
+
+    presets:
+      logsCollection:                      # file_log on /var/log/pods of this node
+        enabled: true
+        includeCollectorLogs: false
+        storeCheckpoints: true             # resume where it stopped after a restart
+      kubernetesAttributes: { enabled: true }   # namespace, pod, workload on every signal
+      kubeletMetrics: { enabled: true }         # kubelet_stats: pods and containers on this node
+      hostMetrics: { enabled: true }            # host_metrics: the node itself
+      clusterMetrics: { enabled: true }         # k8s_cluster; the chart adds leader election in this mode
+      annotationDiscovery:                      # scrape pods annotated prometheus.io/scrape on this node
+        metrics: { enabled: true }              # (Istio, cert-manager, istiod)
+
+    ports:
+      # Reached only through the Service: no hostPort on the nodes.
+      otlp: { hostPort: 0 }
+      otlp-http: { hostPort: 0 }
+      jaeger-compact: { enabled: false }
+      jaeger-thrift: { enabled: false }
+      jaeger-grpc: { enabled: false }
+      zipkin: { enabled: false }
+
+    config:
+      extensions:
+        # The events preset adds nothing in DaemonSet mode, so events come from
+        # k8s_objects - collected by one pod only, through its own Lease.
+        k8s_leader_elector/k8s_objects:
+          auth_type: serviceAccount
+          lease_name: otel-k8s-objects
+          lease_namespace: monitoring
       receivers:
-        otlp:
-          grpc: { enabled: true, port: 4317 }
-          http: { enabled: true, port: 4318 }
+        jaeger: null
+        zipkin: null
+        k8s_objects:
+          auth_type: serviceAccount
+          k8s_leader_elector: k8s_leader_elector/k8s_objects
+          objects:
+            - { name: events, mode: watch }
+      exporters:
+        otlp_http/prometheus:
+          endpoint: http://prometheus-server.monitoring.svc/api/v1/otlp
+        otlp_http/loki:
+          endpoint: http://loki.monitoring.svc:3100/otlp
+        otlp_grpc/tempo:
+          endpoint: tempo.monitoring.svc:4317
+          tls: { insecure: true }
+      service:
+        extensions:
+          - health_check
+          - file_storage                   # checkpoints for logsCollection
+          - k8s_observer                   # annotation discovery
+          - k8s_leader_elector/k8s_cluster # added by the clusterMetrics preset
+          - k8s_leader_elector/k8s_objects
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_grpc/tempo]
+          metrics:
+            receivers: [otlp, prometheus, kubeletstats, hostmetrics, k8s_cluster, receiver_creator/metrics]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_http/prometheus]
+          logs:
+            receivers: [otlp, file_log, k8s_objects]
+            processors: [memory_limiter, k8s_attributes, batch]
+            exporters: [otlp_http/loki]
 ```
 
-The feature and key names are from the chart's default values (all features
-present, all disabled); the nesting under each feature must be confirmed against
-`helm show values k8s-monitoring --version 4.5.2` while implementing. The chart
-brings the Alloy operator and its CRDs, so `deploy.sh` applies this part last
-and waits for the CRDs.
+What the render produced with these values: a DaemonSet whose container declares
+`otlp` 4317 and `otlp-http` 4318 with no `hostPort`; Service `otel-collector`
+with `internalTrafficPolicy: Local` on 4317/4318; and a ClusterRole covering
+leases, events, nodes, `nodes/stats`, pods, namespaces and workloads.
+
+### How services send telemetry
+
+Every service uses the same endpoint; no per-pod configuration beyond it:
+
+```yaml
+env:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.monitoring.svc:4318
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    value: http/protobuf
+```
+
+The collector identifies the sending pod by the connection address, which the
+Service path preserves, and adds namespace, pod and workload itself.
 
 ## Step 6: Grafana
 
@@ -432,20 +559,20 @@ helmCharts:
       datasources.yaml:
         apiVersion: 1
         datasources:
-          - name: Mimir
-            uid: mimir
+          - name: Prometheus
+            uid: prometheus
             type: prometheus
-            url: http://mimir.monitoring.svc:8080/prometheus
+            url: http://prometheus-server.monitoring.svc
             isDefault: true
             jsonData:
-              exemplarTraceIdDestinations:
-                - { name: traceID, datasourceUid: tempo }
+              exemplarTraceIdDestinations:          # metric -> trace
+                - { name: trace_id, datasourceUid: tempo }
           - name: Loki
             uid: loki
             type: loki
             url: http://loki.monitoring.svc:3100
             jsonData:
-              derivedFields:                     # a trace id in a log line links to Tempo
+              derivedFields:                         # log -> trace
                 - name: traceID
                   matcherRegex: '(?:traceID|trace_id|traceId)[=:"\s]+(\w+)'
                   url: '$${__value.raw}'
@@ -455,19 +582,23 @@ helmCharts:
             type: tempo
             url: http://tempo.monitoring.svc:3200
             jsonData:
-              tracesToLogsV2: { datasourceUid: loki, filterByTraceID: true }
-              tracesToMetrics: { datasourceUid: mimir }
-              serviceMap: { datasourceUid: mimir }
+              tracesToLogsV2: { datasourceUid: loki, filterByTraceID: true }   # trace -> logs
+              tracesToMetrics: { datasourceUid: prometheus }                   # trace -> metrics
+              serviceMap: { datasourceUid: prometheus }                        # service graph
               nodeGraph: { enabled: true }
 ```
 
-Dashboards, pinned by grafana.com id **and revision** so an upstream edit cannot
-change them underneath: the Kubernetes views that `k8s-monitoring` documents,
-and Istio's official dashboards (Mesh 7639, Service 7636, Workload 7630). The
-revisions are chosen and pinned while implementing.
+Logs that arrive through OTLP carry the trace id as structured metadata as well;
+the derived field covers ids written into the log line itself.
+
+**Dashboards,** pinned by grafana.com id **and revision**: Kubernetes views built
+for OpenTelemetry metric names (the classic kube-state-metrics dashboards will
+not find their series), and Istio's official dashboards (Mesh 7639, Service
+7636, Workload 7630), which apply unchanged. Revisions are chosen and pinned
+while implementing.
 
 `./hosts.sh` picks up `grafana.kind.local` on its own, because it is an Ingress
-host — no change to the script.
+host.
 
 ## Step 7: Grafana logs in through Keycloak
 
@@ -497,8 +628,9 @@ taught.
     defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
 ```
 
-`identity/setup-host.sh` gains `gen grafana-client-secret` and passes
-`GRAFANA_CLIENT_SECRET` to keycloak-config-cli, like the two existing clients.
+`identity/setup-host.sh` gains `gen grafana-client-secret` and
+`gen grafana-admin-password`, and passes `GRAFANA_CLIENT_SECRET` to
+keycloak-config-cli.
 
 **Grafana's side,** in the chart's `grafana.ini`:
 
@@ -532,12 +664,11 @@ taught.
         disable_login_form: false        # the local admin stays reachable
 ```
 
-Plus, in the chart values: `extraConfigmapMounts` mounting ConfigMap
-`kind-root-ca` (key `ca.crt`) at `/etc/ssl/kind`, and `envValueFrom`
-setting `GRAFANA_OIDC_CLIENT_SECRET` from Secret `grafana-oidc`.
+Plus `extraConfigmapMounts` mounting ConfigMap `kind-root-ca` (key `ca.crt`) at
+`/etc/ssl/kind`, and `envValueFrom` setting `GRAFANA_OIDC_CLIENT_SECRET` from
+Secret `grafana-oidc`.
 
-**`platformservices/deploy.sh`,** inside the existing `identity/out` block,
-creates the two Secrets that must not be in git:
+**`platformservices/deploy.sh`,** inside the existing `identity/out` block:
 
 ```bash
 from_files kubectl -n monitoring create secret generic grafana-oidc \
@@ -547,11 +678,9 @@ from_files kubectl -n monitoring create secret generic grafana-admin \
     --from-literal=admin-password="$(cat "$IDENTITY/grafana-admin-password")"
 ```
 
-(`grafana-admin-password` is generated by `identity/setup-host.sh` with the
-others.)
-
 **The resulting mapping,** to be added to the *Identities and roles* section of
-`architecture.md`:
+`architecture.md` with the new credential rows
+(`identity/out/grafana-client-secret`, `identity/out/grafana-admin-password`):
 
 | Group | Grafana role |
 | --- | --- |
@@ -560,13 +689,12 @@ others.)
 | no group | `Viewer` |
 
 Grafana resolves `keycloak.kind.local` through the CoreDNS hosts entry that
-`identity/cluster-dns.sh` already writes — no new DNS step.
+`identity/cluster-dns.sh` already writes.
 
 ## Step 8: Traces from the mesh
 
-Istio sends spans to Alloy's OTLP receiver. In
-`platformservices/istio/kustomization.yaml`, the `istiod` chart gets its first
-`valuesInline`:
+In `platformservices/istio/kustomization.yaml`, the `istiod` chart gets its first
+`valuesInline`, pointing the mesh at the same Service every other service uses:
 
 ```yaml
   valuesInline:
@@ -574,7 +702,7 @@ Istio sends spans to Alloy's OTLP receiver. In
       extensionProviders:
         - name: otel
           opentelemetry:
-            service: k8s-monitoring-alloy-receiver.monitoring.svc.cluster.local
+            service: otel-collector.monitoring.svc.cluster.local
             port: 4317
 ```
 
@@ -592,101 +720,129 @@ spec:
       randomSamplingPercentage: 100   # a dev cluster: every request is interesting
 ```
 
-`testapp-mesh` then produces traces with no code changes. The receiver's service
-name is the chart's; confirm it in the render.
+`testapp-mesh` then produces traces with no code changes; Tempo turns them into
+span metrics with exemplars, and those land in Prometheus — the end-to-end path
+for metric → trace links in this cluster.
 
 ## Step 9: Wiring into the platform
 
 - **Aggregate** `platformservices/kustomization.yaml` gains `monitoring`.
-- **`platformservices/deploy.sh`** applies it after Istio, in dependency order:
+- **`platformservices/deploy.sh`** applies it after Istio, backends first:
 
 ```bash
-# 6. Monitoring: storage first, then the collectors that write to it, then Grafana
+# 6. Monitoring: storage first, then the collector that writes to it, then Grafana
 apply monitoring/namespace
-apply monitoring/mimir;       kubectl -n monitoring rollout status statefulset/mimir --timeout=300s
-apply monitoring/loki;        kubectl -n monitoring rollout status statefulset/loki --timeout=300s
-apply monitoring/tempo;       kubectl -n monitoring rollout status statefulset/tempo --timeout=300s
-apply monitoring/collection   # CRDs for the Alloy operator come first in the render
-apply monitoring/grafana;     available monitoring
+apply monitoring/prometheus;      kubectl -n monitoring rollout status deployment/prometheus-server --timeout=300s
+apply monitoring/loki;            kubectl -n monitoring rollout status statefulset/loki --timeout=300s
+apply monitoring/tempo;           kubectl -n monitoring rollout status statefulset/tempo --timeout=300s
+apply monitoring/otel-collector;  kubectl -n monitoring rollout status daemonset/otel-collector --timeout=300s
+apply monitoring/grafana;         available monitoring
 ```
-
-(Istio's `meshConfig` change is part of the `istio` step already applied
-earlier; `istiod` picks it up on restart.)
 
 ## Step 10: Verification
 
-**Backends answer:**
+**One collector per node, node-local Service, no host ports, cluster-wide work
+done once:**
 
 ```bash
-kubectl -n monitoring get pods,pvc
-kubectl -n monitoring port-forward svc/mimir 8080 &
-curl -s localhost:8080/ready                              # ready
-curl -s 'localhost:8080/prometheus/api/v1/query?query=up' | head -c 300
+kubectl -n monitoring get daemonset otel-collector            # DESIRED = READY = 3
+kubectl -n monitoring get svc otel-collector -o jsonpath='{.spec.internalTrafficPolicy}'; echo   # Local
+kubectl -n monitoring get daemonset otel-collector -o jsonpath='{..hostPort}'; echo              # empty
+kubectl -n monitoring get lease                               # one holder per lease
 ```
 
-**Each signal arrives:**
+**A service reaches the collector through the Service name:**
 
 ```bash
-# Metrics: series from kube-state-metrics and the kubelet
-curl -s 'localhost:8080/prometheus/api/v1/query?query=count(kube_pod_info)'
-# Logs: a namespace's recent lines
+kubectl run otlp-test --image=harbor.kind.local:3443/library/busybox:1.36 --restart=Never --rm -i \
+  --command -- sh -c 'nc -z -w3 otel-collector.monitoring.svc 4318 && echo reachable'
+```
+
+**Prometheus has the data, with Kubernetes labels, and not three times over:**
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus-server 9090:80 &
+q() { curl -s "localhost:9090/api/v1/query" --data-urlencode "query=$1"; echo; }
+q 'count by (k8s_namespace_name) (k8s_pod_phase)'     # per-namespace series: promotion works
+q 'count(k8s_node_condition_ready)'                   # 3, not 9: leader election works
+q 'prometheus_http_requests_total{handler=~"/api/v1/(otlp|write).*"}'
+```
+
+**Exemplars, logs and traces** (after some traffic to `testapp-mesh.kind.local`):
+
+```bash
+curl -s 'localhost:9090/api/v1/query_exemplars?query=traces_spanmetrics_latency_bucket&start=-15m' | head -c 400
 kubectl -n monitoring port-forward svc/loki 3100 &
-curl -s 'localhost:3100/loki/api/v1/query_range' --data-urlencode 'query={namespace="argocd"}' | head -c 300
-# Traces: after a few requests against testapp-mesh.kind.local
+curl -s 'localhost:3100/loki/api/v1/query_range' --data-urlencode 'query={k8s_namespace_name="argocd"}' | head -c 300
 kubectl -n monitoring port-forward svc/tempo 3200 &
 curl -s 'localhost:3200/api/search?limit=5' | head -c 300
 ```
 
 **Grafana, in the browser** at `https://grafana.kind.local`: *Sign in with
-Keycloak* as `dev` lands as **Admin**; *Explore* shows all three data sources
-healthy; a trace from `testapp-mesh` opens its logs; the service graph shows the
-mesh.
+Keycloak* as `dev` lands as **Admin**; a latency graph for `testapp-mesh` shows
+exemplar dots that open a trace; that trace opens its logs and metrics; the
+service graph shows the mesh.
 
-**A Playwright suite, `tests/specs/grafana.spec.ts`,** so this login is proven
-the same way as Argo CD's and Harbor's:
+**A Playwright suite, `tests/specs/grafana.spec.ts`:**
 
 - log in through Keycloak and assert `/api/user` reports `dev` with
   `isGrafanaAdmin: true`, and `/api/org` role `Admin`;
-- call `/api/datasources/uid/{mimir,loki,tempo}/health` in the logged-in session
-  and assert all three are `OK`.
-
-The datasource health checks are what turn "Grafana is up" into "the stack is
-wired".
+- call `/api/datasources/uid/{prometheus,loki,tempo}/health` in the logged-in
+  session and assert all three are `OK`.
 
 ## Known limitations and open points
 
-- **Unverified: Mimir 3 monolithic with ingest storage disabled.** Mimir 3 made
-  the Kafka path the default; the plan assumes the classic path is still
-  supported in monolithic mode. If `ingest_storage.enabled: false` is refused,
-  the fallback is `mimir-distributed` trimmed to one replica per component with
-  Kafka, MinIO and memcached kept small — measurably heavier.
-- **Unverified: exact value keys** in `k8s-monitoring` 4.5.2 below the feature
-  level, in the Tempo 3.0 chart, and the service names each chart renders.
-  Every one is checked against `helm show values` and the rendered manifests
-  before wiring the next component to it.
-- **cAdvisor filesystem metrics may be missing.** The nodes run with
-  `localStorageCapacityIsolation: false` because of ZFS (ADR-0011), and cAdvisor
-  is what could not read ZFS in the first place.
-- **No high availability, by design.** One replica of each backend; a pod
-  restart is a short gap in ingestion, and the local volumes keep the data.
-- **Retention is disk-bound.** 36 Gi for 15 d / 7 d / 72 h is sized for this
-  cluster's volume; heavier workloads fill it sooner.
-- **Alerting is out of scope.** Mimir ships an Alertmanager and Grafana has
-  alerting; neither is configured here.
+- **`internalTrafficPolicy: Local` has no fallback.** While a node's collector
+  restarts, telemetry sent from pods on that node is dropped rather than routed
+  to another node; SDKs retry for a short while. Acceptable for a dev cluster;
+  the price of node-local routing.
+- **Mesh clients: to be observed.** Pods with a sidecar reach the Service through
+  Envoy, which picks endpoints itself. Whether Envoy honours
+  `internalTrafficPolicy: Local` decides only locality, not correctness — every
+  collector exports the same way — so this is noted, not a blocker.
+- **The presets rely on deprecated component names** (`hostmetrics`,
+  `kubeletstats`) that 0.160 still accepts. Upgrading the image without the chart,
+  or the chart past the point where the aliases go, can break the config — upgrade
+  them together and re-run `validate`.
+- **Validated, not yet run.** The collector configuration passes
+  `otelcol-k8s validate`; behaviour against the live API server and the leader
+  election in practice are confirmed only once deployed (Step 10).
+- **Dashboards need OpenTelemetry-aware choices.** Community Kubernetes
+  dashboards built on kube-state-metrics, cAdvisor and node-exporter names will
+  show no data. If they are wanted, kube-state-metrics and node-exporter can be
+  added and scraped alongside.
+- **Loki's default label mapping** for OTLP decides which attributes become
+  index labels; confirm before relying on queries such as
+  `{k8s_namespace_name="…"}`.
+- **Exemplars are in-memory and experimental** in Prometheus 3.14; the exemplar
+  label name (`trace_id` vs `traceID`) must match what Tempo writes.
+- **Unverified: Tempo 3.0 value keys**, including the remote-write exemplar
+  switch.
+- **cAdvisor-style filesystem metrics may be missing** because of ZFS
+  (ADR-0011); `kubelet_stats` reads the kubelet's own summary API, which may
+  behave differently — to be seen.
+- **No high availability, by design; retention is disk-bound; alerting is out of
+  scope.**
 
 ## Planned ADR (for `architecture.md` once applied)
 
-**ADR-0019: Observability with the Grafana stack, monolithic, on local volumes.**
-(ADR-0018 is reserved by the postponed update-setup-04.)
-Context: the platform had no metrics, logs or traces, and debugging meant
-`kubectl logs`. The Grafana stack covers all three signals with correlation
-between them, and Grafana fits the existing Keycloak login. Decision: Mimir,
-Loki and Tempo in monolithic mode in namespace `monitoring`, on TopoLVM volumes
-without an object store; Mimir from plain manifests because its chart has no
-monolithic mode and defaults to Kafka; charts from `grafana-community`, where
-Grafana, Loki and Tempo are maintained now; collection through `k8s-monitoring`
-and Alloy; Grafana as a Keycloak client with roles from the groups claim.
-Consequences: one place for metrics, logs and traces with links between them,
-at ~1.5–2.5 GiB of memory; no high availability and disk-bound retention; the
-Mimir setup is hand-maintained rather than chart-managed, and scaling it means
-moving to `mimir-distributed`.
+**ADR-0019: Observability with the OpenTelemetry Collector, Prometheus, Loki,
+Tempo and Grafana.** (ADR-0018 is reserved by the postponed update-setup-04.)
+Context: the platform had no metrics, logs or traces. The Grafana stack covers
+the three signals with correlation between them, and Grafana fits the Keycloak
+login. Mimir and Grafana's Alloy-based `k8s-monitoring` were the first drafts;
+Mimir's chart defaults to Kafka with no monolithic mode, and Alloy ties the
+collection layer to one vendor's configuration language. Decision: one
+OpenTelemetry Collector DaemonSet — pod logs and host metrics exist only per
+node — reached by every service and by Istio through a single Service with
+`internalTrafficPolicy: Local`, without host ports; cluster-wide receivers under
+leader election; no gateway until central processing is needed. OTLP end to end
+into Prometheus (store and query only, with promoted resource attributes and
+exemplar storage), Loki and Tempo, all monolithic on TopoLVM volumes; Grafana as
+a Keycloak client with roles from the groups claim. Consequences: vendor-neutral
+collection in plain YAML, one endpoint for every service and no cross-node hop,
+links between all three signals, at roughly 1.2–2 GiB of memory; OpenTelemetry
+metric names instead of the classic Prometheus ones, so dashboards are chosen for
+them; a node's telemetry pauses while its collector restarts; exemplars only for
+recent data; chart and collector image pinned together because the presets rely
+on name aliases; no high availability.
