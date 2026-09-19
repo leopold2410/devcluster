@@ -37,6 +37,7 @@ C4Container
     title Container diagram: kind development platform
 
     Person(dev, "Developer", "Deploys and tries out workloads")
+    System_Ext(upstreams, "Upstream registries", "Docker Hub, quay.io, ghcr.io, registry.k8s.io, public.ecr.aws")
 
     System_Boundary(host, "Host (Ubuntu, Docker, systemd)") {
         Container(cli, "CLI tools", "k9s, lazydocker (Compose project kind-cli)", "Cluster and Docker operation; own images, pinned versions")
@@ -44,7 +45,7 @@ C4Container
         Container(envoys, "kindccm-* proxies", "Envoy containers", "One per LoadBalancer Service and per namespace with Ingresses")
         Container(lvmd, "lvmd", "systemd unit, gRPC over a Unix socket", "Creates and resizes LVM volumes for TopoLVM")
         ContainerDb(vg, "Volume group topolvm-vg", "LVM on a loop-backed file", "Backing store of all node volumes")
-        Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA")
+        Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA; pull-through cache for five upstream registries")
         Container(keycloak, "Keycloak", "Docker Compose: keycloak + PostgreSQL, port 8443", "Central identity provider standing in for a company IdP; realm localdev as code")
         ContainerDb(vault, "Vault", "Docker Compose, file storage, port 8200; also on the kind network", "Secrets store; configured by Terraform in vault/config")
         ContainerDb(pki, "Local PKI", "OpenSSL files in pki/out", "Root CA plus intermediates for cert-manager, the Istio mesh and the host-side services")
@@ -89,7 +90,9 @@ C4Container
     Rel(istio, pki, "Mesh certificates from the mesh CA", "Secret cacerts")
     Rel(trustmgr, apps, "Provides the root certificate", "ConfigMap per namespace")
     Rel(argocd, guestbook, "Deploys into any namespace", "Kubernetes API")
-    Rel(apps, harbor, "Pulls images", "HTTPS via containerd, certs.d")
+    Rel(apps, harbor, "Pulls images: its own and, as a mirror, all upstream ones", "HTTPS via containerd, certs.d")
+    Rel(harbor, upstreams, "Fetches and caches on first pull", "HTTPS, proxy-cache projects")
+    Rel(apps, upstreams, "Fallback when Harbor is down", "HTTPS, hosts.toml server")
 
     Rel(dev, keycloak, "Logs in once for the platform", "HTTPS, browser")
     Rel(argocd, keycloak, "OIDC discovery and token validation", "HTTPS via CoreDNS to the kind gateway")
@@ -143,25 +146,35 @@ flowchart TD
 
 ## Registry
 
-Harbor runs on the host, so images outlive the cluster.
+Harbor runs on the host, so images outlive the cluster. It also mirrors every
+registry the cluster pulls from (update-setup-07, ADR-0025), so a rebuilt cluster
+pulls its images from the host rather than from the internet.
 
 ```mermaid
 flowchart LR
     subgraph hostside["Host"]
         compose["Docker Compose project harbor<br/>9 containers, ports 3030/3443"]
+        proxies["Proxy-cache projects<br/>dockerhub, quay, ghcr,<br/>registry-k8s, ecr-public"]
         cert["Server certificate harbor.kind.local<br/>issued by the local issuing CA"]
         prep["./prepare (root, one-time)<br/>renders configs and secrets"]
     end
     subgraph clusterside["kind cluster"]
-        containerd["containerd on every node<br/>/etc/containerd/certs.d/harbor.kind.local:3443"]
-        pod["Pod pulls<br/>harbor.kind.local:3443/library/..."]
+        containerd["containerd on every node<br/>certs.d/harbor.kind.local:3443<br/>certs.d/UPSTREAM/hosts.toml"]
+        pod["Pod pulls<br/>harbor.kind.local:3443/library/...<br/>or quay.io/... unchanged"]
     end
+    upstream["Upstream registries<br/>docker.io, quay.io, ghcr.io,<br/>registry.k8s.io, public.ecr.aws"]
+    table["registry/mirrors.tsv"]
 
     prep --> compose
     cert --> compose
-    containerd -->|"HTTPS to 172.21.0.1<br/>CA: kind-dev root"| compose
+    compose --- proxies
+    proxies -->|"first pull, tag checks"| upstream
+    containerd -->|"HTTPS to 172.21.0.1<br/>CA: kind-dev root<br/>/v2/PROJECT/... (override_path)"| compose
+    containerd -.->|"fallback when Harbor fails"| upstream
     pod --> containerd
     dev["Developer / CI"] -->|"push, UI"| compose
+    table -.->|"proxy-cache.sh"| proxies
+    table -.->|"kind-trust.sh"| containerd
 ```
 
 - **Trust:** the certificate comes from the same local CA as everything else, so
@@ -173,6 +186,24 @@ flowchart LR
   URLs it generates, and the port becomes part of the registry name in every
   image tag.
 - **Privileges:** only `prepare` needs root; running Harbor does not.
+- **Mirrors:** one table, `registry/mirrors.tsv`, drives both sides.
+  `registry/proxy-cache.sh` creates a registry endpoint and a public proxy-cache
+  project per upstream. `registry/kind-trust.sh` writes
+  `/etc/containerd/certs.d/<upstream>/hosts.toml`, pointing at
+  `https://harbor.kind.local:3443/v2/<project>` with `override_path`, and uses
+  the original registry as `server`, the fallback. Image names stay unchanged,
+  and no chart or manifest knows about Harbor.
+- **What the cache holds:** only the platforms that were pulled. Harbor stores a
+  trimmed index (amd64 only here) under the tag, about six minutes after the
+  first pull, so its digest differs from the upstream index digest.
+- **Upstream down:** Harbor serves cached tags and platform manifests from its
+  store (verified with Docker Hub unreachable from `harbor-core`). A pull pinned
+  to the *upstream index digest* is not in the cache, because of the trimming.
+- **Harbor down:** containerd logs `trying next host` and pulls from the
+  original registry (verified with Harbor's nginx stopped).
+- **Size:** each proxy project gets Harbor's default retention rule (keep what
+  was pulled in the last 7 days, daily at 00:00 UTC). `proxy-cache.sh` adds a
+  weekly garbage collection (Sunday 01:00 UTC), which frees the layers on disk.
 
 ## Observability
 
@@ -845,3 +876,31 @@ without the binding, Vault answers the login with `403 permission denied`
 (verified), and it recovers when the binding returns. The token must keep the
 API server's default audience, because it also authenticates the TokenReview
 call — a Vault-only audience would be rejected by the API server first.
+
+## ADR-0025: Harbor as a transparent pull-through cache for every upstream registry
+
+**Date:** 2026-09-19 · **Status:** Accepted
+
+**Context.** Every cluster rebuild pulls the same images again from five
+registries — Docker Hub, quay.io, ghcr.io, registry.k8s.io and public.ecr.aws.
+Those pulls depend on each registry's availability and on Docker Hub's rate limit,
+although Harbor already runs on the host and outlives the cluster.
+
+**Decision.** One proxy-cache project in Harbor per upstream, used by the nodes
+through a containerd `hosts.toml` per upstream. The file uses `override_path` to
+reach Harbor's `/v2/<project>` path and keeps the original registry as `server`,
+the fallback. Image names stay unchanged. One table, `registry/mirrors.tsv`,
+drives Harbor's side (`registry/proxy-cache.sh`) and the nodes' side
+(`registry/kind-trust.sh`). Optional Docker Hub credentials live in
+`registry/out/dockerhub-credentials`, out of git. Harbor's default 7-day
+retention stays, plus a weekly garbage collection. Rewriting image names to
+`harbor.kind.local:3443/<project>/...` in the manifests was rejected: every chart
+would need changes, and every pull would fail while Harbor is down.
+
+**Consequences.** Repeat pulls come from the host and survive cluster rebuilds:
+3.0 s instead of 10.4 s for a 35 MB image, with no internet round trip for the
+layers. No chart or manifest changes. Harbor is on the pull path but is not a
+single point of failure, and it serves cached tags while an upstream is down.
+The first pull of each image still goes upstream. The cache holds only the pulled
+platform, so a pull pinned to the upstream index digest bypasses it. The host's
+own Docker (Harbor, Keycloak, Vault, test containers) is not covered.

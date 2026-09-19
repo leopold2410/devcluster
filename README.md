@@ -37,6 +37,7 @@ cluster/cluster.sh up         # kind cluster, Gateway API CRDs, cloud-provider-k
 cluster/cluster.sh down       # delete the cluster (the PKI and the LVM volume group stay)
 
 registry/setup-host.sh        # optional: Harbor (sudo only for its ./prepare step)
+registry/proxy-cache.sh       # once: Harbor mirrors Docker Hub, quay.io, ghcr.io, registry.k8s.io, public.ecr.aws
 registry/kind-trust.sh        # after every "cluster.sh up" if Harbor is used
 
 identity/setup-host.sh        # optional: Keycloak (no root; one /etc/hosts line is yours)
@@ -437,6 +438,7 @@ anything that trusts the root CA trusts Harbor.
 
 ```bash
 registry/setup-host.sh              # certificate, installer, config, start (sudo only for ./prepare)
+registry/proxy-cache.sh             # once, and after changing mirrors.tsv or the Docker Hub credentials
 registry/kind-trust.sh              # after every cluster.sh up: hosts entry, CA and containerd config in the nodes
 docker compose -f registry/out/harbor/docker-compose.yml ps     # runs as your user
 docker compose -f registry/out/harbor/docker-compose.yml stop   # when you need the memory
@@ -475,6 +477,51 @@ sudo mkdir -p "/etc/docker/certs.d/harbor.kind.local:3443"
 sudo cp pki/out/root-ca.crt "/etc/docker/certs.d/harbor.kind.local:3443/ca.crt"
 ./hosts.sh          # supplies harbor.kind.local; do not add it by hand as well
 docker login harbor.kind.local:3443
+```
+
+### Harbor as a mirror
+
+The nodes pull every upstream image through Harbor, so a rebuilt cluster gets its
+images from the host (update-setup-07). Image names do not change: a pod asking
+for `quay.io/argoproj/argocd:v3.5.3` gets it from Harbor's project `quay`.
+
+| Upstream | Harbor project |
+| --- | --- |
+| `docker.io` | `dockerhub` |
+| `quay.io` | `quay` |
+| `ghcr.io` | `ghcr` |
+| `registry.k8s.io` | `registry-k8s` |
+| `public.ecr.aws` | `ecr-public` |
+
+- **One table drives both sides:** `registry/mirrors.tsv`.
+  `registry/proxy-cache.sh` creates the endpoints and proxy-cache projects in
+  Harbor. `registry/kind-trust.sh` writes
+  `/etc/containerd/certs.d/<upstream>/hosts.toml` on every node, but only for
+  projects that exist. containerd reads these files on every pull, so there is
+  no restart.
+- **Adding a registry:** add one line to `mirrors.tsv` (adapter `docker-registry`
+  for any standard registry), then run both scripts again.
+- **Docker Hub credentials** (optional; they lift the anonymous rate limit): put
+  `user:access-token` into `registry/out/dockerhub-credentials` (`chmod 600`,
+  git-ignored) and run `registry/proxy-cache.sh` again.
+- **When Harbor is down,** the nodes pull from the original registry
+  (containerd logs `trying next host`). **When an upstream is down,** Harbor
+  serves what it has cached.
+- **The cache fills lazily:** a pull goes upstream the first time. Harbor lists
+  the image in its project about six minutes later, holding only the pulled
+  platform.
+- **Size:** artifacts not pulled for 7 days are removed (Harbor's default
+  retention per proxy project), and a weekly garbage collection (Sunday 01:00
+  UTC, set by `proxy-cache.sh`) frees their layers.
+- **Your own Docker is not covered,** only the kind nodes.
+
+What is cached, and what a node used:
+
+```bash
+curl -s --cacert pki/out/root-ca.crt https://harbor.kind.local:3443/api/v2.0/projects/quay/repositories \
+  | python3 -m json.tool | grep '"name"'          # public projects, no login needed
+docker exec dev-worker cat /etc/containerd/certs.d/quay.io/hosts.toml
+docker exec dev-worker journalctl -u containerd | grep 'trying next host'   # pulls that fell back
 ```
 
 ## Identity (`identity/`, Keycloak)

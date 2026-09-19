@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-19 |
-| Status | **Planned, not yet applied** |
+| Status | **Applied and verified on 2026-09-19.** All five mirrors serve pulls, and both open points are settled: Harbor serves cached tags while the upstream is down, and each proxy project gets a 7-day retention rule; the missing garbage collection is now scheduled. See *Implementation notes*; where the steps below differ, the files in `registry/` are authoritative |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-02.md`](update-setup-02.md) (Harbor, `registry/kind-trust.sh`), where a Docker Hub mirror was listed as a follow-up |
 
 ## Goals
@@ -289,6 +289,66 @@ and survive cluster rebuilds; no chart or manifest changes; Harbor is on the pul
 path but not a single point of failure; the first pull of each image still goes
 upstream; the host's own Docker is not covered.
 
+## Implementation notes
+
+The plan held, with no deviation in design. Details that differ from the steps
+above, or that the plan could not know:
+
+- **Harbor caches lazily, and only the pulled platform.** containerd resolves a
+  tag with `HEAD` and then fetches the manifests by digest, so a pull at first
+  leaves an untagged platform manifest in the project. About six minutes later
+  Harbor stores a *trimmed* index under the tag, holding only the platforms that
+  were pulled (amd64 here). Its digest therefore differs from the upstream index
+  digest. The repository appears in the API only then; before that, Harbor
+  answers 401 for it, as for anything that does not exist.
+- **Layers shared with another upstream are not re-fetched.** The first
+  `public.ecr.aws/docker/library/alpine:3.22` pull read only 1281 bytes, because
+  the node already had the same layers from Docker Hub's alpine. Without its
+  blobs, Harbor did not cache the manifest in `ecr-public`. With both alpine
+  references removed from the node, the pull went through Harbor completely
+  (3.8 MB) and the repository appeared.
+- **Garbage collection is added.** Harbor gives each proxy project a retention
+  rule, but it removes artifacts only; no garbage collection was scheduled, so
+  the layers would have stayed on disk. `proxy-cache.sh` now sets a weekly one
+  (Sunday 01:00 UTC, after the daily retention run) when none exists. It keeps
+  untagged artifacts, so images pushed to `library` by digest are not touched.
+  Without a schedule, Harbor answers with an empty body or `[]`; the script
+  handles both.
+- **`kind-trust.sh` asks Harbor anonymously** whether a proxy project exists
+  (public projects answer 200, missing ones 401), so it needs no admin password.
+  Upstreams whose project is missing lose their `hosts.toml`.
+- **containerd adds `?ns=<upstream>`** to requests for a mirror
+  (`.../v2/quay/prometheus/busybox/manifests/latest?ns=quay.io`); Harbor ignores
+  it.
+
+Verification evidence (2026-09-19):
+
+```
+proxy-cache  five endpoints healthy, five public proxy projects (dockerhub, quay, ghcr,
+             registry-k8s, ecr-public); a second run changes nothing
+nodes        /etc/containerd/certs.d/<upstream>/hosts.toml on all three nodes, 5 mirrors
+pulls        docker.io/library/alpine:3.22, quay.io/prometheus/busybox:latest,
+             ghcr.io/stefanprodan/podinfo:6.15.0, registry.k8s.io/pause:3.9,
+             public.ecr.aws/docker/library/alpine:3.22: each repository appeared in its
+             project, tagged
+cache hit    podinfo 6.15.0 (34.8 MB): 10.4 s cold on dev-worker, 3.0 s on dev-worker2
+             from Harbor's cache
+pod          kubectl run mirror-test --image=docker.io/library/busybox:1.37: ran with the
+             name unchanged; dockerhub/library/busybox:1.37 cached
+upstream     registry-1.docker.io and auth.docker.io cut off inside harbor-core:
+  down       "failed to proxy manifest, fallback to local"; ctr pulled and ran
+             harbor.kind.local:3443/dockerhub/library/busybox:1.37 from the cache alone
+             (the upstream index digest itself: 404 while offline, see above)
+Harbor down  nginx stopped: containerd "trying next host", quay.io/prometheus/busybox
+             pulled from quay.io in 2.3 s; Harbor back up, ping 200
+workloads    images removed from all nodes, pods deleted: Grafana (docker.io),
+             argocd-server (quay.io), external-secrets (ghcr.io), argocd-redis
+             (public.ecr.aws) all came back Ready; no fallback logged; each image
+             cached under its tag in its project
+retention    every proxy project: retain "nDaysSinceLastPull 7", daily 00:00 UTC;
+             garbage collection "0 0 1 * * 0" set by proxy-cache.sh
+```
+
 ## Known limitations and open points
 
 - **The first pull still goes upstream.** The mirrors pay off from the second
@@ -296,13 +356,15 @@ upstream; the host's own Docker is not covered.
 - **Preloaded images are not pulled.** The kind node image carries most of
   `registry.k8s.io` already; its mirror serves whatever is not preloaded.
 - **Tags are checked upstream.** For a tag, Harbor asks the upstream whether it
-  changed; pulls by digest are served from the cache alone. **To verify:**
-  Harbor's documented behaviour of serving the cached copy when the upstream is
-  unreachable.
-- **Cache size.** Cached images take space in Harbor's data volume on the host.
-  **To verify:** the retention Harbor applies to proxy-cache projects by default
-  (reported as removing artifacts not pulled for 7 days); if absent, a tag
-  retention rule per project is the next step.
+  changed. **Verified:** when the upstream is unreachable, Harbor serves the
+  cached tag ("fallback to local"). A pull pinned to the *upstream index digest*
+  is not in the cache, because Harbor stores a trimmed index. Online it is
+  fetched upstream; offline Harbor answers 404, and the node falls back to the
+  (equally unreachable) upstream.
+- **Cache size.** Cached images take space in Harbor's data volume on the host
+  (`registry/out/data`). **Verified:** each proxy project gets a retention rule
+  that keeps artifacts pulled within 7 days, run daily at 00:00 UTC. Garbage
+  collection was not scheduled; `proxy-cache.sh` now adds a weekly run.
 - **The host's Docker is not covered.** Harbor, Keycloak, Vault and the test
   containers are pulled by the host's Docker, whose `registry-mirrors` setting
   in `/etc/docker/daemon.json` works for Docker Hub only and needs sudo and a
