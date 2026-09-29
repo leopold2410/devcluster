@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Teach the cluster the names of the host-side services (update-setup-03, -06).
-# Keycloak and Vault run in Docker Compose on the host; pods reach them at the kind bridge
+# Teach the cluster the names of the host-side services (update-setup-03, -06, -08).
+# Keycloak, Vault and Harbor run in Docker Compose on the host; pods reach them at the kind bridge
 # gateway, so CoreDNS gets a hosts block mapping their names there. Each service is listed
 # once it is set up (its out/ directory exists).
 # Run after every cluster/cluster.sh up - the Corefile is part of the cluster.
@@ -16,6 +16,9 @@ HOST_IP=$(docker network inspect kind -f '{{range .IPAM.Config}}{{if .Gateway}}{
 names=()
 [[ -d "$ROOT/identity/out" ]] && names+=("${KEYCLOAK_HOSTNAME:-keycloak.kind.local}")
 [[ -d "$ROOT/vault/out" ]]    && names+=("${VAULT_HOSTNAME:-vault.kind.local}")
+# Nodes pull through /etc/hosts (registry/kind-trust.sh); pods need it for the Trivy Operator's
+# scan jobs, which fetch images from Harbor themselves
+[[ -d "$ROOT/registry/out" ]] && names+=("${HARBOR_HOSTNAME:-harbor.kind.local}")
 if [[ ${#names[@]} == 0 ]]; then
     echo "no host-side services set up - nothing to add"
     exit 0

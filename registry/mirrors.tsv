@@ -1,6 +1,8 @@
 # Harbor as a pull-through cache for every registry the cluster pulls from (update-setup-07).
-# Read by registry/proxy-cache.sh (Harbor's side) and registry/kind-trust.sh (the nodes' side),
-# so the two cannot drift apart. Adding a registry: one line, then re-run both scripts.
+# Read by registry/proxy-cache.sh (Harbor's side), registry/kind-trust.sh (the nodes' side) and
+# registry/scanning.sh (scan on arrival). Adding a registry: one line, then re-run the three
+# scripts - and add it to the Trivy Operator's trivy.registry.mirror map in
+# platformservices/trivy-operator/kustomization.yaml, so its scan jobs use the mirror too.
 #
 # upstream        adapter           url                       project        fallback
 docker.io         docker-hub        https://hub.docker.com    dockerhub      https://registry-1.docker.io
@@ -8,3 +10,5 @@ quay.io           docker-registry   https://quay.io           quay           htt
 ghcr.io           github-ghcr       https://ghcr.io           ghcr           https://ghcr.io
 registry.k8s.io   docker-registry   https://registry.k8s.io   registry-k8s   https://registry.k8s.io
 public.ecr.aws    docker-registry   https://public.ecr.aws    ecr-public     https://public.ecr.aws
+mirror.gcr.io     docker-registry   https://mirror.gcr.io     mirror-gcr     https://mirror.gcr.io
+reg.kyverno.io    docker-registry   https://reg.kyverno.io    kyverno        https://reg.kyverno.io

@@ -20,6 +20,8 @@ OUT="$SCRIPT_DIR/out"
 : "${HARBOR_HTTP_PORT:=3030}"
 : "${HARBOR_HTTPS_PORT:=3443}"
 HARBOR_URL="https://$HARBOR_HOSTNAME:$HARBOR_HTTPS_PORT"
+: "${HARBOR_WITH_TRIVY:=true}"
+ROOT_CA="$(cd "$SCRIPT_DIR/../pki/out" && pwd)/root-ca.crt"
 # Keep the password of an earlier run unless one is given explicitly
 if [[ -z ${HARBOR_ADMIN_PASSWORD:-} && -f "$OUT/harbor/harbor.yml" ]]; then
     HARBOR_ADMIN_PASSWORD=$(awk '/^harbor_admin_password:/{print $2}' "$OUT/harbor/harbor.yml")
@@ -44,8 +46,14 @@ if [[ ! -d "$OUT/harbor" ]]; then
     tar -xzf "$OUT/harbor-installer.tgz" -C "$OUT"
 fi
 
-# Render Harbor's own template; only these fields differ from its defaults
+# Render Harbor's own template; only these fields differ from its defaults.
+# storage_service.ca_bundle (update-setup-08): prepare empties
+# common/config/shared/trust-certificates on every run and refills it only from harbor.yml.
+# Every Harbor container mounts that directory as /harbor_cust_cert, and core needs the kind
+# root CA there to reach Keycloak - so the CA goes in as the "storage" CA bundle, which prepare
+# copies back in as storage_ca_bundle.crt each time. The storage itself stays filesystem.
 sed -E \
+    -e "s|^# storage_service:$|storage_service:\n  ca_bundle: $ROOT_CA\n  filesystem:\n    maxthreads: 100\n# (Harbor's commented example follows)\n# storage_service:|" \
     -e "s|^hostname: .*|hostname: $HARBOR_HOSTNAME|" \
     -e "s|^  port: 80$|  port: $HARBOR_HTTP_PORT|" \
     -e "s|^  port: 443$|  port: $HARBOR_HTTPS_PORT|" \
@@ -57,11 +65,15 @@ sed -E \
     "$OUT/harbor/harbor.yml.tmpl" > "$OUT/harbor/harbor.yml"
 
 cd "$OUT/harbor"
-# Re-run prepare only when the configuration actually changed (not just its timestamp)
-config_hash=$(sha256sum harbor.yml | cut -d' ' -f1)
+# Trivy is a prepare flag, not a harbor.yml setting (update-setup-08)
+prepare_args=()
+[[ $HARBOR_WITH_TRIVY == true ]] && prepare_args+=(--with-trivy)
+# Re-run prepare only when the configuration or its flags actually changed (not just a timestamp)
+config_hash=$( { cat harbor.yml; echo "prepare ${prepare_args[*]}"; } | sha256sum | cut -d' ' -f1)
 if [[ ! -f docker-compose.yml || ! -f .harbor.yml.sha256 || $(cat .harbor.yml.sha256) != "$config_hash" ]]; then
-    echo "running ./prepare (needs root: privileged container, writes the configs as root)"
-    sudo ./prepare              # renders docker-compose.yml, the nginx config and the secrets
+    echo "running ./prepare ${prepare_args[*]} (needs root: privileged container, writes the configs as root)"
+    sudo ./prepare "${prepare_args[@]}"   # renders docker-compose.yml, the nginx config and the secrets
+    echo "$config_hash" > .harbor.yml.sha256
     grant_read=true
 else
     # Can this user read the env files Compose needs? If not, fix that once.

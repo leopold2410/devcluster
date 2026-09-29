@@ -1,0 +1,58 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Trivy Operator (update-setup-08): scans what runs in the cluster - vulnerabilities, config
+# audit, RBAC assessment and exposed secrets - and stores the results as reports next to the
+# workloads. It does not block anything; Kyverno reads the reports at admission.
+resources:
+- namespace.yaml
+helmCharts:
+- name: trivy-operator
+  repo: https://aquasecurity.github.io/helm-charts/
+  version: 0.36.0
+  releaseName: trivy-operator
+  namespace: trivy-system
+  includeCRDs: true                       # the chart keeps its CRDs in crds/
+  valuesInline:
+    podAnnotations:                       # scraped by the OTel collector (update-setup-05)
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: /metrics
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 512Mi}
+    operator:
+      # ClientServer: the vulnerability database lives once, in the trivy-server StatefulSet,
+      # instead of being downloaded by every scan job
+      builtInTrivyServer: true
+      scanJobsConcurrentLimit: 2          # default 10; a laptop
+      sbomGenerationEnabled: false        # large objects in etcd
+      infraAssessmentScannerEnabled: false  # node-collector jobs reading node files; kind's own control plane
+      clusterComplianceEnabled: false
+    compliance:
+      specs: []                           # rendered even with compliance off otherwise
+    trivy:
+      # Image mode: the scan job's Trivy fetches the image itself, past the node's containerd
+      # mirrors - so it gets the same Harbor proxy projects (update-setup-07). Keys are the
+      # registry as go-containerregistry normalises it (nginx -> index.docker.io/library/nginx);
+      # the operator replaces that prefix. Keep in step with registry/mirrors.tsv.
+      registry:
+        mirror:
+          "index.docker.io": harbor.kind.local:3443/dockerhub
+          "quay.io": harbor.kind.local:3443/quay
+          "ghcr.io": harbor.kind.local:3443/ghcr
+          "registry.k8s.io": harbor.kind.local:3443/registry-k8s
+          "public.ecr.aws": harbor.kind.local:3443/ecr-public
+          "mirror.gcr.io": harbor.kind.local:3443/mirror-gcr
+          "reg.kyverno.io": harbor.kind.local:3443/kyverno
+    trivyOperator:
+      # Harbor's certificate comes from the kind root CA: one more file in the scan image's CA
+      # directory, from trust-manager's ConfigMap (trivy.sslCertDir would be a hostPath)
+      scanJobCustomVolumes:
+        - name: kind-root-ca
+          configMap:
+            name: kind-root-ca
+      scanJobCustomVolumesMount:
+        - name: kind-root-ca
+          mountPath: /etc/ssl/certs/kind-root-ca.crt
+          subPath: ca.crt
+          readOnly: true

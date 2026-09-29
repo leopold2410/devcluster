@@ -28,16 +28,12 @@ curl_harbor() {  # the CA and the host resolution in one place
 
 # 1. Harbor verifies the issuer's certificate, which comes from the local CA, so the CA has
 # to be in Harbor's custom certificate directory (mounted into the containers as
-# /harbor_cust_cert). ./prepare created that directory as root, so this one copy needs sudo.
-if [[ ! -f "$TRUST/kind-dev-root-ca.crt" ]]; then
-    cat >&2 <<EOF
-Harbor does not trust the local root CA yet. That is one root-owned copy:
-
-  sudo cp $PKI/root-ca.crt $TRUST/kind-dev-root-ca.crt
-  docker compose -f $COMPOSE restart core jobservice proxy
-
-Then run this script again.
-EOF
+# /harbor_cust_cert). ./prepare empties that directory on every run, so registry/setup-host.sh
+# hands the CA to prepare as storage_service.ca_bundle, which prepare copies back in as
+# storage_ca_bundle.crt (update-setup-08). kind-dev-root-ca.crt is the manual copy from
+# update-setup-03, valid until the next prepare.
+if [[ ! -f "$TRUST/storage_ca_bundle.crt" && ! -f "$TRUST/kind-dev-root-ca.crt" ]]; then
+    echo "Harbor does not trust the local root CA yet - run registry/setup-host.sh first." >&2
     exit 1
 fi
 
