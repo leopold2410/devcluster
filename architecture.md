@@ -318,6 +318,128 @@ sequenceDiagram
   reaches the Kubernetes Secret within the refresh interval (3 s in the test,
   30 s at most).
 
+## Security scanning
+
+Two scanners, both Trivy, answering different questions (update-setup-08).
+**Harbor scans what is stored**, **the Trivy Operator scans what runs.** Neither
+blocks anything: a vulnerable image still pulls and still starts, and the result
+is a report.
+
+**Status:** the in-cluster side runs. Harbor's `trivy-adapter` arrives with the
+next `registry/setup-host.sh` run, which needs one root `prepare`; the Kyverno
+warning at admission is still open in update-setup-08.
+
+```mermaid
+flowchart LR
+    subgraph clusterside["kind cluster"]
+        op["Trivy Operator<br/>(trivy-system)"]
+        job["scan job per workload<br/>image mode, unprivileged"]
+        srv["trivy-server<br/>vulnerability database, 5 Gi volume"]
+        rep[("Reports per workload:<br/>Vulnerability, ConfigAudit,<br/>ExposedSecret, RbacAssessment")]
+        otel["OTel Collector"]
+        prom["Prometheus"]
+        graf["Grafana"]
+    end
+    subgraph hostside["Host"]
+        adapter["Harbor trivy-adapter"]
+        harbor[("library + proxy caches")]
+        ui["Harbor UI, Security Hub"]
+    end
+    db["trivy-db<br/>mirror.gcr.io, ghcr.io"]
+
+    op --> job
+    job -->|"image via the Harbor mirror,<br/>CA from kind-root-ca"| harbor
+    job -->|"package list"| srv --> db
+    job --> rep
+    op -->|"metrics"| otel --> prom --> graf
+    adapter -->|"on arrival, daily 02:00 UTC"| harbor
+    adapter --> db
+    adapter --> ui
+```
+
+### What is scanned, and how
+
+| Scan | Scope | How it works | Result |
+| --- | --- | --- | --- |
+| **Image vulnerabilities, in the cluster** | every image of every workload, `kube-system` and the node image's preloaded ones included | the operator starts a scan job per workload; Trivy fetches the image and has `trivy-server` match its packages against the database | `VulnerabilityReport` |
+| **Workload configuration** | pods and their controllers, plus Services, Roles, Ingresses, quotas | static checks (`AVD-KSV-…`) against the manifest as admitted — this is where "your deployment should do X" findings come from | `ConfigAuditReport` |
+| **RBAC** | Roles and ClusterRoles | static checks for rules that grant too much | `RbacAssessmentReport` |
+| **Secrets in images** | the same images | Trivy's secret scanner looks for credentials baked into the layers | `ExposedSecretReport` |
+| **Image vulnerabilities, in the registry** | every artifact Harbor stores: `library` and the seven proxy caches | Harbor's `trivy-adapter` scans on arrival (`auto_scan`) and rescans everything daily at 02:00 UTC | Harbor's UI and API |
+
+How the in-cluster side works, and why:
+
+- **Rescanned every 24 hours** (`scannerReportTTL`), so a CVE published today
+  turns up in an image deployed last week.
+- **The database lives once,** in the `trivy-server` StatefulSet (ClientServer
+  mode) on a TopoLVM volume. Scan jobs send package lists to it instead of each
+  downloading tens of MB.
+- **Two scan jobs at a time** (`scanJobsConcurrentLimit`), for a laptop.
+- **Scan jobs pull through Harbor.** `trivy.registry.mirror` maps each upstream
+  onto its proxy project, so a scan reuses the cache of ADR-0025 and doesn't hit
+  Docker Hub's rate limit. Harbor's certificate is verified with the kind root
+  CA, mounted into the job from trust-manager's `kind-root-ca` ConfigMap; pods
+  resolve `harbor.kind.local` through the CoreDNS block of
+  `cluster/host-services-dns.sh`.
+- **Reports name the original image** (`index.docker.io/grafana/tempo:3.0.3`),
+  not the mirrored path, so they are comparable with what the manifests say.
+- **Reports belong to their workload:** they live in its namespace and are
+  deleted with it.
+- **Deliberately off:** SBOM reports (large objects in etcd), infra assessment
+  (its node-collector reads node files) and CIS compliance (findings about
+  kind's own control plane that nobody here can act on).
+
+### What this is not
+
+- **Not runtime security.** Everything above is static analysis of images and
+  manifests. Nothing observes a running container's syscalls, processes or
+  traffic — that would be Falco or Tetragon, and neither is installed.
+- **Not enforcement.** Harbor's `prevent_vul` stays off, and no admission
+  webhook rejects a workload. Kyverno with a warning at admission is the next
+  step in update-setup-08.
+- **Not the host's containers.** Harbor, Keycloak, Vault and the CLI containers
+  run in the host's Docker. Their images are scanned only if Harbor happens to
+  store them.
+- **One platform per image:** the proxy caches hold amd64 only, so that is what
+  gets scanned.
+
+### Where the findings appear
+
+```bash
+# In the cluster, per workload
+kubectl get vulnerabilityreports -A            # image CVEs, with counts per severity
+kubectl get configauditreports -A              # configuration findings
+kubectl get exposedsecretreports -A
+kubectl get rbacassessmentreports -A
+kubectl -n argocd get vulnerabilityreport <name> -o json | \
+    python3 -c 'import sys,json; r=json.load(sys.stdin)["report"]; print(r["summary"]); \
+      [print(v["vulnerabilityID"], v["severity"], v["resource"], v.get("fixedVersion","-")) for v in r["vulnerabilities"][:10]]'
+```
+
+- **Grafana:** the operator's metrics are scraped by the OTel Collector through
+  its `prometheus.io/*` annotations, so counts per image and severity
+  (`trivy_image_vulnerabilities`) are queryable in Prometheus and can be
+  dashboarded next to the rest (update-setup-05).
+- **Harbor:** per artifact in the UI (*Projects → repository → tag*), aggregated
+  in its *Security Hub*, and at `/api/v2.0/security/summary`.
+- **Not in kubectl events or logs:** findings are only in the reports above.
+
+What a first full round looked like (2026-09-19, 25 distinct images): most images
+clean, the worst `ghcr.io/dexidp/dex` with 5 CRITICAL, `registry.k8s.io/etcd`
+with 3, Argo CD and its Redis with 2 each. The configuration audit flagged
+"default security context" and "root file system is not read-only" on 23
+workloads each, host networking on 6, and privileged containers on 2 — the
+platform's own components. No secrets were found in any image.
+
+### Where it is configured
+
+| Piece | File |
+| --- | --- |
+| Trivy Operator, its mirrors, the CA mount | `platformservices/trivy-operator/kustomization.yaml` |
+| Harbor's scanner (a `prepare` flag) | `versions.env` (`HARBOR_WITH_TRIVY`), `registry/setup-host.sh` |
+| Harbor's schedule and `auto_scan` | `registry/scanning.sh` |
+| Which upstreams are mirrored, and therefore scanned on arrival | `registry/mirrors.tsv` |
+
 ## Identities and roles
 
 Two parallel paths lead into every service: identities from Keycloak, and local
