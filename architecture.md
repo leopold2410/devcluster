@@ -1694,8 +1694,9 @@ Three things follow from kind, where every node is a container on one kernel:
   see every system call three times, and also those of the host's own
   processes and of Harbor, Keycloak, Vault and RustFS. Each instance can only
   name the containers of its own node, because it reads container metadata from
-  that node's containerd. This is expected from how eBPF works and has to be
-  measured; it decides how Falco is deployed.
+  that node's containerd. A test on 2026-09-30 confirmed it (update-setup-10):
+  one read of a file in a pod was reported by all three instances, and only the
+  one on the pod's node could name the pod.
 - **The desktop is in view.** Rules for the "host" would fire on the developer's
   own shell and browser. That is noise, and it is more observation of the laptop
   than a dev cluster should do.
@@ -1772,8 +1773,10 @@ run time (Falco). A shell in a pod or a read of a service account token shows up
 Grafana within seconds, and can be followed from the dashboard to the pod's logs
 and traces.
 
-The costs: one more privileged component on every node that reads all system
-calls, and memory for three instances, not yet measured. Without Falcosidekick
+The costs: one more component on every node that reads all system calls. In
+the test each instance used 160 MiB of memory and about 12 % of one core on a
+quiet system, because each of the three processes the whole machine's system
+calls before the filter drops what is not its own. Without Falcosidekick
 the findings share a log stream with Falco's own messages and have no labels of
 their own in Loki; the dashboard separates them by their JSON fields. The
 default rules fire on normal platform behaviour (operators that read secrets,
