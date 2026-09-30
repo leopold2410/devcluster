@@ -37,55 +37,65 @@ same host but outside the cluster, so that it exists before the cluster and
 survives a rebuild. The container diagram below opens up both sides.
 
 ```mermaid
-C4Context
-    title System context: kind development platform
+flowchart TB
+    subgraph people[" "]
+        direction LR
+        localadmin(["<b>Local admin</b><br/>root on the host and the local<br/>break-glass accounts"]):::person
+        admin(["<b>Platform admin</b><br/>builds and operates the platform,<br/>member of platform-admins"]):::person
+        dev(["<b>Developer</b><br/>deploys and tries out workloads,<br/>logs in through Keycloak"]):::person
+    end
 
-    Person(dev, "Developer", "Deploys and tries out workloads; logs in through Keycloak")
-    Person(admin, "Platform admin", "Builds and operates the platform from this repository; member of platform-admins")
-    Person(localadmin, "Local admin", "Owner of the host: root on it, and the local break-glass accounts of every service")
+    subgraph host["Host (Ubuntu, Docker, systemd)"]
+        lb["<b>cloud-provider-kind</b><br/>LoadBalancer addresses and the<br/>default Ingress, as Envoy containers"]:::hostsys
+        cluster["<b>kind cluster dev</b><br/>Kubernetes 1.36: platform<br/>services and applications"]:::focus
+        storage["<b>Host storage</b><br/>lvmd and the LVM volume<br/>group topolvm-vg"]:::hostsys
+        pki["<b>Local PKI</b><br/>root CA and intermediates,<br/>files in pki/out"]:::hostsys
+        rustfs["<b>RustFS</b><br/>object store for backups"]:::hostsys
+        vault["<b>Vault</b><br/>secrets store"]:::hostsys
+        harbor["<b>Harbor</b><br/>container registry and<br/>pull-through cache"]:::hostsys
+        keycloak["<b>Keycloak</b><br/>identity provider,<br/>realm localdev"]:::hostsys
+    end
 
-    Enterprise_Boundary(host, "Host (Ubuntu, Docker, systemd)") {
-        System(cluster, "kind cluster dev", "Kubernetes 1.36: platform services and applications")
-        System_Ext(lb, "cloud-provider-kind", "LoadBalancer IPs and the default Ingress, as Envoy containers")
-        System_Ext(harbor, "Harbor", "Container registry and pull-through cache")
-        System_Ext(keycloak, "Keycloak", "Identity provider, realm localdev")
-        System_Ext(vault, "Vault", "Secrets store")
-        System_Ext(rustfs, "RustFS", "Object store for backups")
-        System_Ext(storage, "Host storage", "lvmd and the LVM volume group topolvm-vg")
-        System_Ext(pki, "Local PKI", "Root CA and intermediates, files in pki/out")
-    }
+    github["<b>GitHub</b><br/>this repository,<br/>read by Argo CD"]:::ext
+    upstreams["<b>Upstream registries</b><br/>Docker Hub, quay.io, ghcr.io,<br/>registry.k8s.io and others"]:::ext
 
-    System_Ext(upstreams, "Upstream registries", "Docker Hub, quay.io, ghcr.io, registry.k8s.io and others")
-    System_Ext(github, "GitHub", "This repository, read by Argo CD")
+    localadmin -->|"sudo"| storage
+    localadmin -->|"create-ca.sh"| pki
+    admin -->|"scripts, kubectl"| cluster
+    dev -->|"kubectl, k9s"| cluster
+    dev -->|"web UIs, applications<br/>HTTPS 443"| lb
+    dev -->|"git push"| github
 
-    Rel(dev, cluster, "Deploys and observes", "kubectl, k9s, web UIs")
-    Rel(dev, lb, "Reaches applications and UIs", "HTTPS")
-    Rel(dev, keycloak, "Logs in", "HTTPS")
-    Rel(dev, harbor, "Pushes images", "HTTPS")
-    Rel(dev, github, "Pushes manifests", "git")
-    Rel(admin, cluster, "Creates, deploys, operates", "scripts, kubectl")
-    Rel(admin, harbor, "Sets up and administers", "scripts, web UI")
-    Rel(admin, keycloak, "Maintains the realm", "scripts, web UI")
-    Rel(admin, vault, "Sets up, manages secrets", "scripts, web UI, CLI")
-    Rel(admin, rustfs, "Sets up, provides buckets", "scripts, web UI, CLI")
-    Rel(localadmin, storage, "Sets up and removes", "sudo")
-    Rel(localadmin, pki, "Creates the CA", "script")
+    lb -->|"traffic: TCP node ports<br/>watch: HTTPS 6443"| cluster
 
-    Rel(lb, cluster, "Forwards traffic, watches Services", "TCP, Kubernetes API")
-    Rel(cluster, harbor, "Pulls and scans images", "HTTPS")
-    Rel(cluster, keycloak, "Validates logins", "OIDC")
-    Rel(cluster, vault, "Reads secrets", "HTTPS")
-    Rel(vault, cluster, "Reviews login tokens", "TokenReview")
-    Rel(cluster, rustfs, "Backs up and restores", "S3 over HTTPS")
-    Rel(cluster, storage, "Creates and mounts volumes", "gRPC socket, /dev")
-    Rel(cluster, pki, "Signs with the issuing CA", "Secrets from files")
-    Rel(cluster, github, "Reads application manifests", "git over HTTPS")
-    Rel(cluster, upstreams, "Fallback pulls", "HTTPS")
-    Rel(harbor, upstreams, "Fetches and caches", "HTTPS")
-    Rel(harbor, keycloak, "Login", "OIDC")
-    Rel(vault, keycloak, "Login", "OIDC")
-    Rel(rustfs, keycloak, "Login", "OIDC")
+    cluster -->|"volumes<br/>gRPC socket, /dev"| storage
+    cluster -->|"CA as Secrets"| pki
+    cluster -->|"backups<br/>S3, HTTPS 9000"| rustfs
+    cluster <-->|"secrets: HTTPS 8200<br/>TokenReview: HTTPS 6443"| vault
+    cluster -->|"logins<br/>OIDC, HTTPS 8443"| keycloak
+    cluster -->|"images<br/>HTTPS 3443"| harbor
+    cluster -->|"manifests<br/>HTTPS 443"| github
+    cluster -.->|"fallback pulls<br/>HTTPS 443"| upstreams
+
+    rustfs -->|"login"| keycloak
+    vault -->|"login"| keycloak
+    harbor -->|"login"| keycloak
+    harbor -->|"fetch and cache<br/>HTTPS 443"| upstreams
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff
+    classDef focus fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef hostsys fill:#666,stroke:#444,color:#fff
+    classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+    style people fill:none,stroke:none
 ```
+
+The diagram uses the C4 notation (people, the system in focus in blue, other
+systems in grey) but is drawn as a Mermaid flowchart: Mermaid's own C4 diagram
+places boxes on a fixed grid and cannot route this many relations legibly. Solid
+arrows are the regular paths, the dotted one is a fallback. To keep it readable,
+the arrows from the platform admin and the developer to the individual host
+services are left out; they are in the tables *Web interfaces for people* and
+*Command-line interfaces for people* below.
 
 The three actors are roles, not three people: on this laptop one person has all
 of them, and the Keycloak user `dev` is a member of `platform-admins`.
