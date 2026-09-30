@@ -1,0 +1,47 @@
+# When this application is backed up and how long the backups are kept. Both are the
+# application's decisions; the platform only provides the operator and the bucket.
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: nightly
+  namespace: backup-demo
+spec:
+  backend:
+    repoPasswordSecretRef:
+      name: backup
+      key: repo-password
+    s3:
+      endpoint: https://s3.kind.local:9000
+      bucket: backup-demo
+      accessKeyIDSecretRef:
+        name: backup
+        key: access-key
+      secretAccessKeySecretRef:
+        name: backup
+        key: secret-key
+    # The object store's certificate comes from the local CA; trust-manager puts the root
+    # CA into every namespace as the ConfigMap kind-root-ca.
+    tlsOptions:
+      caCert: /mnt/ca/ca.crt
+    volumeMounts:
+      - name: ca
+        mountPath: /mnt/ca/
+  backup:
+    schedule: '0 2 * * *'
+    failedJobsHistoryLimit: 2
+    successfulJobsHistoryLimit: 2
+    volumes:
+      - name: ca
+        configMap:
+          name: kind-root-ca
+  prune:
+    schedule: '0 4 * * 0'
+    failedJobsHistoryLimit: 2
+    successfulJobsHistoryLimit: 2
+    retention:
+      keepLast: 5
+      keepDaily: 7
+    volumes:
+      - name: ca
+        configMap:
+          name: kind-root-ca

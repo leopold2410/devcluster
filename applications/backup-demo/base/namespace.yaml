@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backup-demo
+  labels:
+    # No sidecars: backup and restore run as Jobs, which would never finish with one.
+    istio-injection: disabled

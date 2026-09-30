@@ -1,0 +1,15 @@
+# A backup on request: syncing this application creates a K8up Backup. No automated sync.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backup-demo-backup
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/leopold2410/devcluster.git
+    targetRevision: main
+    path: applications/backup-demo/backup
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: backup-demo

@@ -14,14 +14,17 @@ A local multi-node Kubernetes cluster on [kind](https://kind.sigs.k8s.io/)
 - metrics, logs and traces: the OpenTelemetry Collector, Prometheus, Loki, Tempo
   and Grafana;
 - HashiCorp Vault for secrets, in Docker Compose, read by the cluster through
-  ESO.
+  ESO;
+- backup and restore for application databases: K8up in the cluster, RustFS as
+  the object store in Docker Compose.
 
 Built up step by step, each plan applied and verified:
 [`update-setup-01.md`](update-setup-01.md) (platform, 2026-09-15),
 [`update-setup-02.md`](update-setup-02.md) (storage and registry, 2026-09-16),
 [`update-setup-03.md`](update-setup-03.md) (Keycloak, 2026-09-17),
-[`update-setup-05.md`](update-setup-05.md) (observability, 2026-09-18) and
-[`update-setup-06.md`](update-setup-06.md) (Vault, 2026-09-18);
+[`update-setup-05.md`](update-setup-05.md) (observability, 2026-09-18),
+[`update-setup-06.md`](update-setup-06.md) (Vault, 2026-09-18) and
+[`update-setup-09.md`](update-setup-09.md) (backup and restore, 2026-09-30);
 [`update-setup-04.md`](update-setup-04.md) (OIDC for the API server) is
 postponed. The design and its decisions are in
 [`architecture.md`](architecture.md). This replaced the 2023 kind + MetalLB +
@@ -44,6 +47,8 @@ identity/setup-host.sh        # optional: Keycloak (no root; one /etc/hosts line
 cluster/host-services-dns.sh  # after every "cluster.sh up": pods resolve Keycloak and Vault
 
 vault/setup-host.sh           # optional: Vault (no root; unseals after every restart)
+
+objectstore/setup-host.sh     # optional: RustFS, the object store for backups (no root)
 ```
 
 You need on `PATH`:
@@ -70,15 +75,18 @@ Step 0 of the plan has checksum-verified install commands for kubectl and helm.
 │   ├── deploy.sh             # applies the parts in dependency order
 │   ├── cert-manager/  trust-manager/  istio/  external-secrets/  argocd/
 │   ├── monitoring/           # OpenTelemetry Collector, Prometheus, Loki, Tempo, Grafana
+│   ├── k8up/                 # the backup operator
 │   └── keda/                 # old 2.11.0 manifest, not deployed
 ├── storage/              # host side of TopoLVM: loop device, volume group, lvmd systemd units
 ├── registry/             # Harbor via Docker Compose; out/ is generated (git-ignored)
 ├── identity/             # Keycloak via Docker Compose; the realm is code in realm/localdev.yaml
 ├── vault/                # Vault via Docker Compose; config/ is its Terraform project
+├── objectstore/          # RustFS via Docker Compose: one bucket per namespace for backups
 ├── tests/                # Playwright browser suites for the Keycloak logins
 ├── applications/         # one folder per test application, each with its own deploy.sh
 │   ├── deploy.sh             # deploys the default ones (testapp)
 │   ├── testapp/  testhelm/
+│   ├── backup-demo/          # PostgreSQL with backup and restore, deployed by Argo CD
 │   └── secret-test/          # own git repository (git-ignored here)
 └── cli/                  # Compose project "kind-cli": k9s.sh, lazydocker.sh
 ```
@@ -382,6 +390,8 @@ gateway (B) or in the service (A).
   is uncommitted in that repository for review. Deploy it with
   `kubectl apply -k applications/secret-test/overlays/local`.
 - **`testhelm`:** a sample Helm chart, with Ingress class `cloud-provider-kind`.
+- **`backup-demo`:** a PostgreSQL database that backs itself up with K8up and
+  can be restored, deployed by Argo CD. See *Backup and restore* below.
 
 ## CLI tools (`cli/`)
 
@@ -728,6 +738,111 @@ cluster/host-services-dns.sh   # after every cluster.sh up: pods resolve vault.k
 - **After a new cluster** re-run `vault/setup-host.sh`: it exports the new
   cluster's CA and Terraform updates the Kubernetes auth.
 
+## Backup and restore (`objectstore/`, `platformservices/k8up/`)
+
+The cluster is disposable, so data on its volumes is lost with it. Application
+databases are therefore backed up to an object store outside the cluster
+(update-setup-09, ADR-0029 and ADR-0030):
+
+- **RustFS** runs in Docker Compose on the host at `https://s3.kind.local:9000`
+  and holds one bucket per namespace. It survives `cluster/cluster.sh down` and
+  a rebuild of the TopoLVM volume group.
+- **K8up** is the backup operator in the cluster. It backs nothing up by itself:
+  an application asks for a backup with a `Backup` or `Schedule` resource in its
+  own namespace.
+- **No cluster or deployment state is backed up.** The cluster comes back from
+  `cluster/cluster.sh up`, the applications from git. Only data comes from a
+  backup. Logs, metrics and traces are not backed up.
+
+```bash
+objectstore/setup-host.sh                  # start RustFS; safe to re-run, also after a reboot
+objectstore/setup-host.sh myapp            # bucket, key and repository password for namespace myapp
+objectstore/rc.sh bucket list kind         # RustFS's client, in a container
+./hosts.sh                                 # adds s3.kind.local (sudo if it changes /etc/hosts)
+cluster/host-services-dns.sh               # pods resolve s3.kind.local
+```
+
+The console is at https://s3.kind.local:9001/rustfs/console/ with the Keycloak
+login. Members of `platform-admins` may do everything, members of
+`platform-users` may read; anyone else cannot log in. The local admin key in
+`objectstore/out/admin/` is what the scripts use.
+
+### What the platform provides per namespace
+
+`objectstore/setup-host.sh <namespace>` creates, once:
+
+| What | Where |
+| --- | --- |
+| A bucket named after the namespace | RustFS |
+| A key that may use this bucket only | RustFS; `objectstore/out/keys/` |
+| The password of the restic repository in the bucket | `objectstore/out/keys/` |
+| All three, as `access-key`, `secret-key`, `repo-password` | Vault, `secret/backup/<namespace>` |
+
+They live on the host, so a rebuilt cluster gets the same values through an
+`ExternalSecret` and finds its old backups. The repository password is never
+regenerated: a restic repository cannot be opened with another one.
+
+### What an application has to do
+
+Applications are responsible for their own backups. An application that holds
+data worth keeping:
+
+1. **Reads its bucket key** with an `ExternalSecret` on `backup/<namespace>`.
+2. **Says how its database is dumped,** as annotations on the pod:
+   `k8up.io/backupcommand` (for PostgreSQL: `pg_dump -Fc -Z0`) and
+   `k8up.io/file-extension`. K8up stores the output as one file named
+   `/<namespace>-<container><extension>`.
+3. **Excludes the data volume** with `k8up.io/backup: "false"` on the claim. A
+   file copy of a running database is not a backup.
+4. **Decides when and how long:** a `Schedule` with `backup` and `prune`, or a
+   `Backup` before a planned teardown.
+5. **Brings its own restore:** a Job that reads the dump with `restic dump` and
+   loads it, here with `pg_restore --clean --if-exists`. K8up's own `Restore`
+   resource cannot restore a dump made by a backup command.
+6. **Trusts the local CA:** `tlsOptions.caCert` with the ConfigMap
+   `kind-root-ca` for K8up, `--cacert` for restic.
+
+An application that does none of this loses its data with the cluster, as
+before.
+
+### The demo: `applications/backup-demo/`
+
+A PostgreSQL database with a nightly `Schedule`, deployed by Argo CD. Argo CD
+reads this repository from GitHub, so it deploys what is pushed.
+
+```bash
+applications/backup-demo/deploy.sh         # bucket and keys, then three Argo CD applications
+
+kubectl -n backup-demo exec postgres-0 -- psql -U demo -d demo \
+  -c "create table notes(id serial primary key, body text); insert into notes(body) values ('keep me');"
+
+applications/backup-demo/sync.sh backup    # a backup now
+kubectl -n backup-demo get backups,snapshots
+
+kubectl -n backup-demo exec postgres-0 -- psql -U demo -d demo -c "drop table notes;"
+applications/backup-demo/sync.sh restore   # the newest backup, back into the database
+kubectl -n backup-demo exec postgres-0 -- psql -U demo -d demo -c "select * from notes;"
+```
+
+| Argo CD application | Path | Sync | What a sync does |
+| --- | --- | --- | --- |
+| `backup-demo` | `base/` | automated | deploys the database, the secrets and the `Schedule` |
+| `backup-demo-backup` | `backup/` | by hand | creates a K8up `Backup` |
+| `backup-demo-restore` | `restore/` | by hand | runs the restore Job |
+
+`sync.sh` does what the *Sync* button of the two manual applications does. After
+the cluster was rebuilt: `deploy.sh` brings back an empty database, `sync.sh
+restore` the data.
+
+Good to know:
+- **After a rebuild, `kubectl get snapshots` is empty** until the next backup
+  runs; K8up lists the repository's snapshots only then. The restore does not
+  need the list: it takes the newest snapshot from the repository.
+- **The first pull of new images is slow.** They come through the Harbor mirrors
+  like all cluster images, and Harbor fetches them on first use.
+- **RustFS and its keys are on the same disk as the data.** This protects
+  against rebuilding the cluster, not against losing the laptop.
+
 ## Browser smoke tests (`tests/`)
 
 The OIDC logins are the part `curl` cannot check: the login button, Keycloak's
@@ -742,8 +857,10 @@ tests/run.sh --headed                  # watch it (needs an X server reachable f
 ```
 
 One suite per service — `specs/argocd.spec.ts`, `specs/harbor.spec.ts`,
-`specs/grafana.spec.ts` and `specs/vault.spec.ts`, with the shared Keycloak form
-handling in `specs/support.ts`. The Grafana suite runs only when monitoring is
+`specs/grafana.spec.ts`, `specs/vault.spec.ts` and `specs/rustfs.spec.ts`, with
+the shared Keycloak form handling in `specs/support.ts`. The RustFS suite runs
+once the object store is set up and asserts that `dev` becomes an administrator
+through `platform-admins`. The Grafana suite runs only when monitoring is
 deployed (`run.sh` looks for its Ingress) and also asserts that all three data
 sources pass Grafana's own health check. The Vault suite runs once Vault is set
 up; it follows Vault's OIDC popup and asks Vault which policies the resulting
@@ -784,6 +901,8 @@ points:
   their logical volumes stay on the host when the cluster is deleted;
 - the loop file sits on ZFS here, so it's copy-on-write on copy-on-write: fine
   for dev, but not a performance reference;
+- backups exist only for applications that ask for them, and they lie on the
+  same disk as the data;
 - Harbor's `prepare` is a privileged container (see above), Harbor does not come
   back by itself after a reboot, and `registry/kind-trust.sh` has to run after
   every cluster creation.

@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# K8up (update-setup-09, ADR-0029): the backup operator. Applications create Backup and
+# Schedule resources in their own namespace; the operator itself backs nothing up.
+# The backups go to RustFS on the host (objectstore/).
+namespace: k8up-system
+resources:
+- namespace.yaml
+# The chart ships no CRDs; they are a file of the same release. Too large for a
+# client-side apply - platformservices/deploy.sh applies server-side.
+- https://github.com/k8up-io/k8up/releases/download/k8up-4.10.0/k8up-crd.yaml
+helmCharts:
+- name: k8up
+  repo: https://k8up-io.github.io/k8up
+  version: 4.10.0            # operator v2.16.0
+  releaseName: k8up
+  namespace: k8up-system
+patches:
+# The chart's Helm post-install hook deletes leftovers of K8up 1.x in every namespace. Rendered
+# by Kustomize it would be an ordinary Job that runs on every apply. The Job goes, and with it
+# the service account that may delete Roles and RoleBindings cluster-wide.
+- target: {kind: Job, name: k8up-cleanup}
+  patch: |
+    $patch: delete
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: k8up-cleanup
+- target: {kind: ServiceAccount, name: cleanup-service-account}
+  patch: |
+    $patch: delete
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: cleanup-service-account
+- target: {kind: ClusterRole, name: k8up-cleanup-roles}
+  patch: |
+    $patch: delete
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: k8up-cleanup-roles
+- target: {kind: ClusterRoleBinding, name: cleanup-rolebinding}
+  patch: |
+    $patch: delete
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: cleanup-rolebinding

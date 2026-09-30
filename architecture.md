@@ -16,7 +16,7 @@ one host, one cluster, everything reproducible from this repository.
 | Goal | Why |
 | --- | --- |
 | Reproducible | The whole platform comes back from `cluster/cluster.sh up` plus `./deploy.sh`; versions are pinned |
-| Disposable cluster, durable data | Certificates, LVM volumes and registry images survive `cluster.sh down` |
+| Disposable cluster, durable data | Certificates, LVM volumes and registry images survive `cluster.sh down`; application databases are backed up outside the cluster |
 | Production-like | Real ingress paths, mTLS, GitOps, CSI storage and a registry with TLS, rather than shortcuts |
 | Modest resources | Runs next to a desktop on a 16 GB laptop |
 | Portable | Nothing depends on this machine beyond Docker, LVM and systemd; a move to WSL2 stays possible |
@@ -48,6 +48,7 @@ C4Container
         Container(harbor, "Harbor", "Docker Compose: nginx, core, registry, jobservice, portal, db, redis", "Container registry with TLS from the local CA; pull-through cache for five upstream registries")
         Container(keycloak, "Keycloak", "Docker Compose: keycloak + PostgreSQL, port 8443", "Central identity provider standing in for a company IdP; realm localdev as code")
         ContainerDb(vault, "Vault", "Docker Compose, file storage, port 8200; also on the kind network", "Secrets store; configured by Terraform in vault/config")
+        ContainerDb(rustfs, "RustFS", "Docker Compose, ports 9000 and 9001", "Object store for backups: one bucket per namespace; outlives the cluster and the volume group")
         ContainerDb(pki, "Local PKI", "OpenSSL files in pki/out", "Root CA plus intermediates for cert-manager, the Istio mesh and the host-side services")
     }
 
@@ -116,6 +117,8 @@ C4Container
     Rel(eso, vault, "Logs in as vault-auth, reads secret/", "HTTPS, Kubernetes auth")
     Rel(vault, apiserver, "Reviews the login token", "TokenReview, on the kind network")
     Rel(vault, pki, "Server certificate from the issuing CA", "files in vault/out/tls")
+    Rel(apps, rustfs, "Back up and restore their databases", "restic over HTTPS, started by K8up resources")
+    Rel(rustfs, keycloak, "Console login for people", "OIDC")
 ```
 
 ## Storage
@@ -318,6 +321,57 @@ sequenceDiagram
   an `ExternalSecret` references a path under `secret/`. A change in Vault
   reaches the Kubernetes Secret within the refresh interval (3 s in the test,
   30 s at most).
+
+## Backup
+
+Application databases are backed up to an object store on the host; nothing
+else is (update-setup-09, ADR-0029 and ADR-0030). The cluster and the
+deployments come back from git, only data comes from a backup.
+
+```mermaid
+flowchart LR
+    subgraph host["Host, Docker Compose"]
+        rustfs["RustFS<br/>s3.kind.local:9000, console :9001<br/>one bucket per namespace"]
+        vault["Vault<br/>secret/backup/NAMESPACE"]
+        keycloak["Keycloak"]
+    end
+    subgraph cluster["kind cluster"]
+        k8up["K8up operator<br/>k8up-system"]
+        subgraph ns["Application namespace"]
+            es["ExternalSecret"] --> sec["Secret<br/>bucket key, repository password"]
+            sched["Schedule / Backup"] --> job["Backup Job<br/>runs the dump command in the pod"]
+            db["Database pod<br/>annotation: backup command"]
+            restore["Restore Job<br/>restic dump, then load"]
+        end
+    end
+    setup["objectstore/setup-host.sh NAMESPACE"] --> rustfs
+    setup --> vault
+    vault --> es
+    k8up --> job
+    job --> db
+    job -->|"restic, TLS"| rustfs
+    restore -->|"restic, TLS"| rustfs
+    restore --> db
+    keycloak -.->|"console login"| rustfs
+```
+
+- **The platform's part:** the operator, and per namespace a bucket, a key
+  limited to it and a restic repository password. All three are created on the
+  host and kept in RustFS and Vault, so they outlive the cluster; a rebuilt
+  application gets the same values and finds its old backups.
+- **The application's part:** the dump command as a pod annotation, a `Schedule`
+  or `Backup`, the retention, and a restore Job. K8up's `Restore` resource
+  handles volume backups only, not dumps.
+- **One restic repository per namespace.** A dump is one file in it, named after
+  namespace, container and extension, for example `/backup-demo-postgres.dump`.
+- **Trust:** the object store's certificate comes from the local CA. K8up's jobs
+  and the restore Job mount trust-manager's `kind-root-ca` ConfigMap.
+- **People** log in to the RustFS console through Keycloak. RustFS reads policy
+  names from the token claim `policy`, which Keycloak fills from client roles of
+  `rustfs`; the groups `platform-admins` and `platform-users` hand them out.
+- **The demo,** `applications/backup-demo`, is three Argo CD applications: the
+  database with its `Schedule`, and two that are synced by hand, where a sync
+  creates a `Backup` or runs the restore Job.
 
 ## Security scanning
 

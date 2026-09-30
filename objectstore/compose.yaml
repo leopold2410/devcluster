@@ -1,0 +1,33 @@
+# RustFS outside the cluster (update-setup-09): the object store for backups. Like Harbor,
+# Keycloak and Vault, it exists before the cluster and survives "cluster/cluster.sh down".
+# Variables come from ./.env, written by objectstore/setup-host.sh.
+name: objectstore
+
+services:
+  rustfs:
+    image: rustfs/rustfs:${RUSTFS_VERSION:?run objectstore/setup-host.sh}
+    restart: unless-stopped
+    # The host user, so data, logs and keys stay owned by it (the image's own user is 10001).
+    user: "${HOST_UID:?}:${HOST_GID:?}"
+    environment:
+      RUSTFS_ACCESS_KEY_FILE: /admin/access-key
+      RUSTFS_SECRET_KEY_FILE: /admin/secret-key
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_TLS_PATH: /tls            # needs rustfs_cert.pem and rustfs_key.pem
+      SSL_CERT_FILE: /tls/ca.crt       # the local root CA, for the requests to Keycloak
+      # RustFS refuses outbound requests to private addresses unless the origin is listed
+      RUSTFS_OUTBOUND_ALLOW_ORIGINS: https://${KEYCLOAK_HOSTNAME:?}:${KEYCLOAK_HTTPS_PORT:?}
+    volumes:
+      - ./out/data:/data
+      - ./out/logs:/logs
+      - ./out/tls:/tls:ro
+      - ./out/admin:/admin:ro
+    ports:
+      # The browser on this host, and the pods via the kind bridge gateway (the host).
+      - "127.0.0.1:${RUSTFS_PORT:?}:9000"
+      - "${KIND_GATEWAY:?}:${RUSTFS_PORT}:9000"
+      - "127.0.0.1:${RUSTFS_CONSOLE_PORT:?}:9001"
+      - "${KIND_GATEWAY}:${RUSTFS_CONSOLE_PORT}:9001"
+    extra_hosts:
+      # For the OIDC discovery; independent of the host's /etc/hosts.
+      - "${KEYCLOAK_HOSTNAME}:${KIND_GATEWAY}"

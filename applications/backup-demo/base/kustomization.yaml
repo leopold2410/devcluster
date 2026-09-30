@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# backup-demo (update-setup-09, ADR-0029): a PostgreSQL database that manages its own backups
+# with K8up. Deployed by Argo CD (../argocd/backup-demo.yaml).
+resources:
+- namespace.yaml
+- externalsecrets.yaml
+- postgres.yaml
+- schedule.yaml

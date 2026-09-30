@@ -1,0 +1,65 @@
+# The restore. This directory is the Argo CD application "backup-demo-restore", which is only
+# ever synced by hand: a sync runs this Job, replacing the one of the sync before.
+#
+# K8up's own Restore resource cannot bring back a dump made by a backup command, so the
+# application does it itself: "fetch" reads the dump from the restic repository, "load" puts it
+# into the running database. --clean --if-exists drops what it is about to create, so this
+# works on an empty database after a rebuild and on a filled one.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: restore-db
+  namespace: backup-demo
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: dump
+          emptyDir: {}
+        - name: ca
+          configMap:
+            name: kind-root-ca
+      initContainers:
+        - name: fetch
+          image: restic/restic:0.19.1
+          command: ["sh", "-c"]
+          args:
+            - restic --cacert /ca/ca.crt dump --path "$DUMP_FILE" "$SNAPSHOT" "$DUMP_FILE" > /dump/db.dump && ls -l /dump/db.dump
+          env:
+            - name: DUMP_FILE           # namespace, container name, file extension
+              value: /backup-demo-postgres.dump
+            - name: SNAPSHOT            # or an id from "kubectl -n backup-demo get snapshots"
+              value: latest
+            - name: RESTIC_REPOSITORY
+              value: s3:https://s3.kind.local:9000/backup-demo
+            - name: RESTIC_PASSWORD
+              valueFrom: {secretKeyRef: {name: backup, key: repo-password}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: backup, key: access-key}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: backup, key: secret-key}}
+          volumeMounts:
+            - {name: dump, mountPath: /dump}
+            - {name: ca, mountPath: /ca}
+      containers:
+        - name: load
+          image: postgres:18-alpine     # the version of the database
+          command: ["sh", "-c"]
+          args:
+            - pg_restore --clean --if-exists --no-owner --exit-on-error -d "$PGDATABASE" /dump/db.dump && echo restored
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGDATABASE
+              value: demo
+            - name: PGUSER
+              value: demo
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: postgres, key: password}}
+          volumeMounts:
+            - {name: dump, mountPath: /dump}

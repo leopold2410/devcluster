@@ -1,0 +1,36 @@
+# A backup on request. This directory is the Argo CD application "backup-demo-backup", which
+# is only ever synced by hand: a sync creates this Backup, replacing the one of the sync
+# before. The snapshots stay in the repository; "kubectl -n backup-demo get snapshots".
+apiVersion: k8up.io/v1
+kind: Backup
+metadata:
+  name: on-request
+  namespace: backup-demo
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  failedJobsHistoryLimit: 2
+  successfulJobsHistoryLimit: 2
+  backend:
+    repoPasswordSecretRef:
+      name: backup
+      key: repo-password
+    s3:
+      endpoint: https://s3.kind.local:9000
+      bucket: backup-demo
+      accessKeyIDSecretRef:
+        name: backup
+        key: access-key
+      secretAccessKeySecretRef:
+        name: backup
+        key: secret-key
+    tlsOptions:
+      caCert: /mnt/ca/ca.crt
+    volumeMounts:
+      - name: ca
+        mountPath: /mnt/ca/
+  volumes:
+    - name: ca
+      configMap:
+        name: kind-root-ca

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Teach the cluster the names of the host-side services (update-setup-03, -06, -08).
-# Keycloak, Vault and Harbor run in Docker Compose on the host; pods reach them at the kind bridge
+# Teach the cluster the names of the host-side services (update-setup-03, -06, -08, -09).
+# Keycloak, Vault, Harbor and RustFS run in Docker Compose on the host; pods reach them at the kind bridge
 # gateway, so CoreDNS gets a hosts block mapping their names there. Each service is listed
 # once it is set up (its out/ directory exists).
 # Run after every cluster/cluster.sh up - the Corefile is part of the cluster.
@@ -19,6 +19,8 @@ names=()
 # Nodes pull through /etc/hosts (registry/kind-trust.sh); pods need it for the Trivy Operator's
 # scan jobs, which fetch images from Harbor themselves
 [[ -d "$ROOT/registry/out" ]] && names+=("${HARBOR_HOSTNAME:-harbor.kind.local}")
+# The object store for backups (update-setup-09): K8up's jobs and the restore Jobs write there
+[[ -d "$ROOT/objectstore/out" ]] && names+=("${RUSTFS_HOSTNAME:-s3.kind.local}")
 if [[ ${#names[@]} == 0 ]]; then
     echo "no host-side services set up - nothing to add"
     exit 0

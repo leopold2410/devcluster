@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Browser smoke test for the Keycloak logins in Argo CD and Harbor (update-setup-03).
+# Browser smoke test for the Keycloak logins (update-setup-03; Grafana, Vault and RustFS later).
 # Usage: tests/run.sh [playwright args, e.g. --headed or -g "Harbor"]
 #
 # Runs Playwright in a container on the kind network, with the three host names resolved
@@ -41,6 +41,14 @@ if [[ -s "$SCRIPT_DIR/../vault/out/root-token" ]]; then
     vault_args=(--add-host "${VAULT_HOSTNAME:-vault.kind.local}:$HOST_IP" -e VAULT_URL="$VAULT_URL")
 fi
 
+# RustFS as well (update-setup-09): its suite runs once the object store is set up.
+RUSTFS_URL=""
+rustfs_args=()
+if [[ -s "$SCRIPT_DIR/../objectstore/out/admin/secret-key" ]]; then
+    RUSTFS_URL="https://${RUSTFS_HOSTNAME:-s3.kind.local}:${RUSTFS_CONSOLE_PORT:-9001}"
+    rustfs_args=(--add-host "${RUSTFS_HOSTNAME:-s3.kind.local}:$HOST_IP" -e RUSTFS_URL="$RUSTFS_URL")
+fi
+
 ARGOCD_URL="https://argocd.kind.local"
 HARBOR_URL="https://$HARBOR_HOSTNAME:$HARBOR_HTTPS_PORT"
 KEYCLOAK_URL="https://$KEYCLOAK_HOSTNAME:$KEYCLOAK_HTTPS_PORT"
@@ -68,6 +76,13 @@ if [[ -n $VAULT_URL ]]; then
         "$VAULT_URL/v1/sys/health" && echo OK
 fi
 
+if [[ -n $RUSTFS_URL ]]; then
+    printf '   %-60s ' "$RUSTFS_URL/rustfs/console/"
+    curl -fsS -o /dev/null --cacert "$PKI/root-ca.crt" \
+        --resolve "${RUSTFS_HOSTNAME:-s3.kind.local}:${RUSTFS_CONSOLE_PORT:-9001}:127.0.0.1" \
+        "$RUSTFS_URL/rustfs/console/" && echo OK
+fi
+
 echo "== playwright"
 docker run --rm --init --network kind \
     --add-host "argocd.kind.local:$ARGOCD_IP" \
@@ -75,6 +90,7 @@ docker run --rm --init --network kind \
     --add-host "$HARBOR_HOSTNAME:$HOST_IP" \
     "${grafana_args[@]}" \
     "${vault_args[@]}" \
+    "${rustfs_args[@]}" \
     -e ARGOCD_URL="$ARGOCD_URL" \
     -e HARBOR_URL="$HARBOR_URL" \
     -e KEYCLOAK_REALM="$KEYCLOAK_REALM" \

@@ -8,9 +8,24 @@ enabled: true
 loginWithEmailAllowed: true
 registrationAllowed: false
 
+roles:
+  client:
+    rustfs:
+      # RustFS takes the names of its policies from a token claim, not from groups
+      # (update-setup-09). Each role carries the name of a RustFS policy that
+      # objectstore/setup-host.sh creates; the group of the same name hands it out.
+      - name: platform-admins
+        description: RustFS policy platform-admins (everything)
+      - name: platform-users
+        description: RustFS policy platform-users (read only)
+
 groups:                    # the names say what the rights are for, not what the realm is
   - name: platform-admins  # admin on the platform services (Argo CD, Harbor)
+    clientRoles:
+      rustfs: [platform-admins]
   - name: platform-users
+    clientRoles:
+      rustfs: [platform-users]
   # applications add their own as they arrive, e.g. app-<name>-admins
 
 clientScopes:
@@ -99,6 +114,36 @@ clients:
     webOrigins:
       - https://vault.kind.local:8200
     defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
+
+  - clientId: rustfs                   # update-setup-09: the object store's console
+    name: RustFS
+    enabled: true
+    publicClient: false
+    standardFlowEnabled: true
+    directAccessGrantsEnabled: false
+    secret: $(env:RUSTFS_CLIENT_SECRET)
+    rootUrl: https://s3.kind.local:9001
+    redirectUris:
+      # RustFS derives the callback from the address the login was started on
+      - https://s3.kind.local:9001/rustfs/admin/v3/oidc/callback/keycloak   # the console
+      - https://s3.kind.local:9000/rustfs/admin/v3/oidc/callback/keycloak   # the API port
+    webOrigins:
+      - https://s3.kind.local:9001
+    defaultClientScopes: [basic, profile, email, roles, web-origins, groups]
+    protocolMappers:
+      # The client roles of rustfs as the claim "policy". Someone in neither group has no
+      # claim and cannot log in to the console.
+      - name: policy
+        protocol: openid-connect
+        protocolMapper: oidc-usermodel-client-role-mapper
+        config:
+          usermodel.clientRoleMapping.clientId: rustfs
+          claim.name: policy
+          multivalued: "true"
+          jsonType.label: String
+          id.token.claim: "true"
+          access.token.claim: "true"
+          userinfo.token.claim: "true"
 
 users:
   - username: dev

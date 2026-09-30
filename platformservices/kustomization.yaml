@@ -20,3 +20,4 @@ resources:
 - argocd
 - monitoring
 - trivy-operator
+- k8up

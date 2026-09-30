@@ -1,0 +1,16 @@
+# The restore on request: syncing this application runs the restore Job, which loads the newest
+# dump into the running database. No automated sync - a restore overwrites data.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backup-demo-restore
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/leopold2410/devcluster.git
+    targetRevision: main
+    path: applications/backup-demo/restore
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: backup-demo

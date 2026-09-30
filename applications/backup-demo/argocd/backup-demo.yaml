@@ -1,0 +1,20 @@
+# The application itself: database, secrets and the nightly Schedule. Synced automatically.
+# Argo CD reads this repository from GitHub, so it deploys what is pushed, not the working tree.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backup-demo
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/leopold2410/devcluster.git
+    targetRevision: main
+    path: applications/backup-demo/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: backup-demo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

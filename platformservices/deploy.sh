@@ -127,3 +127,9 @@ apply monitoring/grafana;         kubectl -n monitoring rollout status deploymen
 # vulnerability database, which it downloads from mirror.gcr.io.
 apply trivy-operator;             available trivy-system
 kubectl -n trivy-system rollout status statefulset/trivy-server --timeout=300s
+
+# 8. Backup (update-setup-09): the K8up operator. It backs nothing up by itself - applications
+# create Backup and Schedule resources. The first pull of its image through the Harbor mirror
+# can take several minutes, hence the longer wait.
+apply k8up
+kubectl -n k8up-system rollout status deployment/k8up --timeout=900s
