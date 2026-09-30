@@ -124,9 +124,9 @@ clients:
     secret: $(env:RUSTFS_CLIENT_SECRET)
     rootUrl: https://s3.kind.local:9001
     redirectUris:
-      # RustFS derives the callback from the address the login was started on
-      - https://s3.kind.local:9001/rustfs/admin/v3/oidc/callback/keycloak   # the console
-      - https://s3.kind.local:9000/rustfs/admin/v3/oidc/callback/keycloak   # the API port
+      # The callback is on the console's origin (RUSTFS_BROWSER_REDIRECT_URL in
+      # objectstore/compose.yaml); "keycloak" is the provider id given to RustFS.
+      - https://s3.kind.local:9001/rustfs/admin/v3/oidc/callback/keycloak
     webOrigins:
       - https://s3.kind.local:9001
     defaultClientScopes: [basic, profile, email, roles, web-origins, groups]

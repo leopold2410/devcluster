@@ -1095,7 +1095,7 @@ ADR-0026 to ADR-0028 are reserved by update-setup-08 (security scanning).
 
 ## ADR-0029: K8up as the backup operator; applications manage their own backups
 
-**Date:** 2026-09-30 · **Status:** Proposed
+**Date:** 2026-09-30 · **Status:** Accepted
 
 **Context.** The cluster is disposable, and it is torn down and recreated in
 normal use. Data on persistent volumes does not survive that. The logical
@@ -1332,12 +1332,13 @@ give no point-in-time recovery. The backups sit on the same disk as the data, so
 this protects against rebuilding the cluster and the volume group, not against
 losing the laptop.
 
-The example in the context has to be shown working with a test application
-before the status changes to Accepted.
+Shown working on 2026-09-30 with the test application `applications/backup-demo`
+(update-setup-09): backup on request and by schedule, prune, and a restore into
+a redeployed, empty database. The operator uses about 30 MB.
 
 ## ADR-0030: RustFS as the object store for backups
 
-**Date:** 2026-09-30 · **Status:** Proposed
+**Date:** 2026-09-30 · **Status:** Accepted
 
 **Context.** ADR-0029 needs a small S3-compatible object store that exists
 before the cluster and outlives it. It runs in Docker Compose on the host, like
@@ -1387,9 +1388,10 @@ product later means changing the Compose file and copying the buckets across.
 RustFS is two weeks past its first stable release. For backups that is the main
 risk, accepted here because the data is dev data and the fallback is cheap.
 
-A throwaway test on 2026-09-30 (update-setup-09) showed RustFS 1.0.0 running as
-the local user, with TLS from the local CA, a key limited to one bucket, and a
-restic backup and restore through K8up. OIDC discovery against Keycloak
-validated, so the console can use the central login; the login itself is not
-tested. Still open before the status changes to Accepted: the installation by
-update-setup-09, the Keycloak login, and Barman Cloud against it.
+Installed and verified on 2026-09-30 (update-setup-09): RustFS 1.0.0 runs as the
+local user with TLS from the local CA and uses about 160 MiB. Each namespace
+has a key limited to its bucket, K8up and restic back up to it and restore from
+it, and the console uses the Keycloak login. Console rights come from the token
+claim `policy`, which has to name stored policies; the built-in ones are not
+accepted there. Not shown: Barman Cloud against RustFS, which matters only once
+an application uses CloudNativePG.

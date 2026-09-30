@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Date | 2026-09-30 |
-| Status | **Planned, not yet applied** |
+| Status | **Applied and verified on 2026-09-30**, with the differences listed under *Implementation notes*. Not run: the full `cluster.sh down` / `up` round trip and a host reboot |
 | Scope | `/home/leo/dev/kind`, builds on [`update-setup-01.md`](update-setup-01.md) (platform services, trust-manager, Argo CD), [`update-setup-02.md`](update-setup-02.md) (TopoLVM), [`update-setup-03.md`](update-setup-03.md) (Keycloak), [`update-setup-06.md`](update-setup-06.md) (Vault, External Secrets) and [`update-setup-07.md`](update-setup-07.md) (Harbor mirrors). Implements ADR-0029 and ADR-0030 in [`architecture.md`](architecture.md) |
 
 ## Goals
@@ -707,6 +707,77 @@ without pull errors.
   corrected.
 - **`update-setup-09.md`:** status, and implementation notes for what differed.
 
+## Implementation notes
+
+What was done differently from the plan above, and what the verification showed.
+
+- **Keycloak group mapping (Step 4) works, but not as planned.** RustFS does not
+  map the `groups` claim to policies. It reads policy names from the claim
+  `policy`, and only accepts policies that are stored, not the built-in ones: a
+  claim naming `consoleAdmin` fails with `OIDC policy mapping did not resolve to
+  current policies`. A fallback policy (`--role-policy`) switches the claim off.
+  So:
+  - `objectstore/setup-host.sh` creates two policies, `platform-admins`
+    (everything) and `platform-users` (read only);
+  - the realm has two client roles of `rustfs` with those names, handed out by
+    the groups of the same names, and a mapper that writes the client roles into
+    the claim `policy`;
+  - someone in neither group cannot log in. There is no fallback policy.
+- **A new or changed OIDC provider needs a restart of RustFS.** The script
+  restarts it then, and only then: the client secret is sent only when its hash
+  changed, because replacing it counts as a change every time.
+- **`rc` takes the client secret from a file only** (`--client-secret-file`).
+- **`RUSTFS_BROWSER_REDIRECT_URL`** is set to the console's origin. Without it
+  RustFS derives the OIDC callback from the request's Host header and logs a
+  warning. The callback is
+  `https://s3.kind.local:9001/rustfs/admin/v3/oidc/callback/keycloak`.
+- **Directories in `objectstore/out/`:** `admin/` for the admin key (the only
+  one mounted into the container) and `keys/` for the bucket keys and repository
+  passwords, instead of one `secrets/`.
+- **`platformservices/k8up/`** also removes the ServiceAccount, ClusterRole and
+  ClusterRoleBinding of the chart's cleanup hook, not only the Job. They would
+  leave an unused account that may delete Roles cluster-wide.
+- **Backup and restore hooks have fixed names** (`on-request`, `restore-db`)
+  with the delete policy `BeforeHookCreation`, instead of `generateName`. A sync
+  replaces the resource of the sync before.
+- **`applications/backup-demo/sync.sh backup | restore`** was added: the
+  `argocd` CLI is not installed on the host, so the script starts the sync
+  through the Application resource and waits for the result.
+- **The `Schedule` repeats the CA volume** under `backup` and `prune`; the
+  `backend` block is inherited from `spec.backend`. Both were confirmed by
+  running the schedule every minute for a test.
+- **The demo has no web page;** `psql` through `kubectl exec` is enough.
+
+Verified:
+
+| Check | Result |
+| --- | --- |
+| RustFS as uid 1000, TLS from the local CA, no `sudo` in `objectstore/` | yes |
+| Bucket, user and policy per namespace; values in Vault | yes |
+| Re-running `objectstore/setup-host.sh` changes nothing and does not restart | yes |
+| Console login through Keycloak as `dev`, administrator via `platform-admins` | yes, `tests/specs/rustfs.spec.ts`; all six browser tests pass |
+| `./deploy.sh` with the new K8up step | exit 0 |
+| Nine CRDs, no hook Job, operator memory | yes; 32 MB |
+| Demo deployed by Argo CD from GitHub, `Synced` and `Healthy` | yes |
+| Backup by sync, restore by sync, twice in a row | yes |
+| `backup-demo` stays `Synced` while K8up's Jobs and Snapshots come and go | yes |
+| Scheduled backup and prune | yes, with the schedule set to every minute |
+| Data loss: namespace and volume deleted, redeployed, restored | yes, the row came back |
+| Trivy Operator scans the new workloads | yes, reports for all four |
+| RustFS memory | 158 MiB |
+
+Not run:
+
+- **The full `cluster.sh down` / `up` round trip** (Step 13, part 4). Deleting the
+  namespace with its volume and restoring into the redeployed, empty database
+  exercises the same path from the application's side. A cluster rebuild would
+  again leave the old logical volumes behind and need `sudo lvremove` first.
+- **A host reboot** and whether RustFS comes back by itself.
+- **The key-is-limited check against the installed RustFS**; it was checked in
+  the throwaway test with the same policy.
+- **`./hosts.sh`** for `s3.kind.local` in `/etc/hosts`: it needs `sudo`. The
+  pods resolve the name through CoreDNS.
+
 ## Known limitations and open points
 
 - **The restore is a Job, not a K8up resource.** K8up's `Restore` does not
@@ -720,10 +791,11 @@ without pull errors.
   (`BACKUP_GLOBALS3ENDPOINT` and others); using them for the endpoint would
   shorten the manifests. Not checked yet, so not planned.
 - **RustFS is two weeks past 1.0.0.** One error appeared in its log at start
-  that was not explained: `failed to verify TLS certificate: invalid peer
-  certificate: UnknownIssuer`, while all client requests worked. Find out what
-  RustFS connects to there.
-- **The Keycloak group mapping is open** (Step 4), with a stated fallback.
+  that is still not explained: `failed to verify TLS certificate: invalid peer
+  certificate: UnknownIssuer`, once per start, while every client request and
+  the Keycloak login work. The log does not say what RustFS connects to there.
+- **Console rights come from Keycloak client roles,** not directly from groups
+  (see the implementation notes).
 - **The admin key of RustFS and all bucket keys lie in `objectstore/out/`,**
   readable by the local user, like Vault's unseal key. Acceptable only for a dev
   cluster.

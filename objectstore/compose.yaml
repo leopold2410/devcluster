@@ -15,6 +15,9 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_TLS_PATH: /tls            # needs rustfs_cert.pem and rustfs_key.pem
       SSL_CERT_FILE: /tls/ca.crt       # the local root CA, for the requests to Keycloak
+      # Where the console is for the browser. Without it RustFS derives the OIDC callback from
+      # the Host header of whoever starts the login.
+      RUSTFS_BROWSER_REDIRECT_URL: https://${RUSTFS_HOSTNAME:?}:${RUSTFS_CONSOLE_PORT:?}
       # RustFS refuses outbound requests to private addresses unless the origin is listed
       RUSTFS_OUTBOUND_ALLOW_ORIGINS: https://${KEYCLOAK_HOSTNAME:?}:${KEYCLOAK_HTTPS_PORT:?}
     volumes:
