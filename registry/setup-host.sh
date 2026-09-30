@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Harbor via Docker Compose (update-setup-02).
-# Usage: registry/setup-host.sh          (./prepare runs with sudo; it writes as root)
+# Usage: registry/setup-host.sh          (as your user, no sudo; also the way to start Harbor
+#                                         again after a reboot)
 #        HARBOR_ADMIN_PASSWORD=... registry/setup-host.sh
 # Harbor's own install.sh is not used: it requires the docker-compose v1 binary.
 #
-# Privileges: only ./prepare needs root (it runs a privileged container that renders the configs
-# and secrets as root, mode 0640). Afterwards the four env files that Compose itself reads are
-# made group-readable for the invoking user, so "docker compose" and day-to-day operation
-# (up/stop/logs) run unprivileged. File owners stay untouched, because Harbor's processes
-# read the same files as uid 10000.
+# Privileges: the script runs as the local user and never calls sudo; it needs the docker group
+# and nothing else. Root exists only inside containers: ./prepare starts a privileged container
+# that renders the configs and secrets as root (mode 0640, owner root or uid 10000). Afterwards
+# the env files that Compose itself reads get the invoking user's group and group read - again
+# from a container, because only root may change the group of root's files. So "docker compose"
+# and day-to-day operation (up/stop/logs) work as the local user. File owners stay untouched,
+# because Harbor's processes read the same files as uid 10000.
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../versions.env"
@@ -71,12 +74,13 @@ prepare_args=()
 # Re-run prepare only when the configuration or its flags actually changed (not just a timestamp)
 config_hash=$( { cat harbor.yml; echo "prepare ${prepare_args[*]}"; } | sha256sum | cut -d' ' -f1)
 if [[ ! -f docker-compose.yml || ! -f .harbor.yml.sha256 || $(cat .harbor.yml.sha256) != "$config_hash" ]]; then
-    echo "running ./prepare ${prepare_args[*]} (needs root: privileged container, writes the configs as root)"
-    sudo ./prepare "${prepare_args[@]}"   # renders docker-compose.yml, the nginx config and the secrets
+    echo "running ./prepare ${prepare_args[*]} (privileged container, writes the configs as root)"
+    ./prepare "${prepare_args[@]}"   # renders docker-compose.yml, the nginx config and the secrets
     echo "$config_hash" > .harbor.yml.sha256
     grant_read=true
 else
-    # Can this user read the env files Compose needs? If not, fix that once.
+    # Can this user read the env files Compose needs? If not (a prepare run outside this
+    # script resets them to root:root 0640), fix that.
     grant_read=false
     for f in common/config/*/env; do [[ -r $f ]] || grant_read=true; done
 fi
@@ -84,11 +88,14 @@ fi
 if [[ $grant_read == true ]]; then
     # Compose (running as this user) has to read the env files; the containers read them as
     # their own uid. So keep the owner and only add group read for this user's group.
-    echo "granting group read on the env files for $(id -un) (needs root once)"
-    sudo chgrp "$(id -g)" common/config/*/env
-    sudo chmod g+r common/config/*/env
+    # The prepare image is already there and brings a shell; no --privileged needed for this.
+    echo "granting group read on the env files for $(id -un)"
+    docker run --rm -v "$PWD/common/config:/config" --entrypoint sh \
+        "goharbor/prepare:${HARBOR_VERSION}" -c "chgrp $(id -g) /config/*/env && chmod g+r /config/*/env"
 fi
 
+# Also brings Harbor back after a reboot: Docker's "restart: always" fails there, because every
+# container logs to harbor-log (syslog on 127.0.0.1:1514) and is started before it listens.
 docker compose up -d
 docker compose ps --format '{{.Name}}\t{{.Status}}'
 

@@ -156,7 +156,7 @@ flowchart LR
         compose["Docker Compose project harbor<br/>9 containers, ports 3030/3443"]
         proxies["Proxy-cache projects<br/>dockerhub, quay, ghcr,<br/>registry-k8s, ecr-public"]
         cert["Server certificate harbor.kind.local<br/>issued by the local issuing CA"]
-        prep["./prepare (root, one-time)<br/>renders configs and secrets"]
+        prep["./prepare (privileged container, one-time)<br/>renders configs and secrets"]
     end
     subgraph clusterside["kind cluster"]
         containerd["containerd on every node<br/>certs.d/harbor.kind.local:3443<br/>certs.d/UPSTREAM/hosts.toml"]
@@ -185,7 +185,8 @@ flowchart LR
   for the cluster ingress. `external_url` makes Harbor put that port into the
   URLs it generates, and the port becomes part of the registry name in every
   image tag.
-- **Privileges:** only `prepare` needs root; running Harbor does not.
+- **Privileges:** the setup runs as the local user, without `sudo`; root exists
+  only inside the `prepare` container.
 - **Mirrors:** one table, `registry/mirrors.tsv`, drives both sides.
   `registry/proxy-cache.sh` creates a registry endpoint and a public proxy-cache
   project per upstream. `registry/kind-trust.sh` writes
@@ -805,6 +806,15 @@ unprivileged.
 **Consequences.** The privileged surface shrinks to a single, visible step
 (verified: the script completes with `sudo` disabled, and Harbor restarts as a
 normal user). `prepare` resets the permissions, so the script re-applies them.
+
+**Amended 2026-09-30.** The script no longer calls `sudo` at all. `prepare` is a
+`docker run`, so the `docker` group is enough to start it, and the group change
+on the env files now happens in a container of the same image. Reason: on
+2026-09-29 the env files were left `root:root` after a `prepare` run, and the
+repair needed a password prompt, which blocked `docker compose up` after the
+next reboot. The rule for the whole setup is local user and group first, root
+only in exceptional cases. The trust decision is unchanged: `docker` group
+membership is root-equivalent, and `prepare` is still privileged.
 The `--privileged` container with `/hostfs` remains a trust decision; swapping
 Harbor for zot would remove it entirely, at the cost of UI, RBAC and scanning.
 
@@ -1026,3 +1036,301 @@ single point of failure, and it serves cached tags while an upstream is down.
 The first pull of each image still goes upstream. The cache holds only the pulled
 platform, so a pull pinned to the upstream index digest bypasses it. The host's
 own Docker (Harbor, Keycloak, Vault, test containers) is not covered.
+
+ADR-0026 to ADR-0028 are reserved by update-setup-08 (security scanning).
+
+## ADR-0029: K8up as the backup operator; applications manage their own backups
+
+**Date:** 2026-09-30 · **Status:** Proposed
+
+**Context.** The cluster is disposable, and it is torn down and recreated in
+normal use. Data on persistent volumes does not survive that. The logical
+volumes stay on the host, but the PersistentVolume and TopoLVM `LogicalVolume`
+objects that bind them to a claim are deleted with the cluster (ADR-0013,
+ADR-0016). On 2026-09-30 a rebuild left the old volumes behind as occupied
+space, and the volume group had to be recreated. For metrics, logs, traces and
+the Trivy database that is acceptable: they refill. It is not acceptable for a
+dev application that hosts a database.
+
+Such an application needs a platform service with these properties:
+
+- The application asks for a backup or a restore by creating a Kubernetes
+  resource in its own namespace. Restore is not tied to redeploying the cluster.
+- The backup of a database is consistent, not a copy of the files of a running
+  server.
+- Only data is backed up. The state of the cluster (etcd) and of the
+  deployments needs no backup: the cluster comes back from
+  `cluster/cluster.sh up`, the platform and the applications from `./deploy.sh`
+  and their manifests in git. That is the quality goal *Reproducible*.
+- The backups lie outside the cluster and outside the TopoLVM volume group.
+- It fits a 16 GB laptop that already runs Harbor, Keycloak and Vault.
+
+The current options, compared. None of them is tested here yet; the statements
+come from the projects' documentation.
+
+| | K8up | CloudNativePG + Barman Cloud plugin | VolSync | Velero | KubeStash |
+| --- | --- | --- | --- | --- | --- |
+| **Backup resource** | `Backup`, `Schedule` | `Backup`, `ScheduledBackup` | `ReplicationSource` | `Backup`, `Schedule` | `BackupConfiguration`, `BackupSession` |
+| **Restore resource** | `Restore` for volume backups, into a volume or a bucket; a command dump comes back only with `restic dump`, for example in a Job | none of its own: a new `Cluster` with `bootstrap.recovery` | `ReplicationDestination`, also as the data source of a new claim | `Restore` | `RestoreSession` |
+| **What it backs up** | volumes, and the output of a command run in the pod | PostgreSQL only: base backups and the WAL | volumes | cluster objects and volumes | volumes and databases through add-ons |
+| **Database consistency** | yes, through a dump command set as a pod annotation | yes, with point-in-time recovery | no: file copy; snapshots would need a thin pool | only through hooks written per application | yes, through the add-ons |
+| **Runs in the cluster** | one operator; a job per backup | one operator and the plugin; backup runs in the database pod | one operator; a job per sync | a server and an agent on every node; 1.5 to 2.2 GB peak measured by the project | one operator and add-on jobs |
+| **Licence, state** | Apache-2.0, CNCF sandbox, restic inside, released this month | Apache-2.0, CNCF; plugin replaces the in-tree backup that is removed in 1.30 | AGPL-3.0, active | Apache-2.0, active | commercial AppsCode product with its own licence |
+
+Stash (stash.run) is not in the table, because KubeStash is its successor
+("Stash 2.0") with a new API, and database backup was an Enterprise feature of
+Stash. All five need an S3-compatible object store; ADR-0030 selects it.
+
+What working with K8up looks like for an application, with a PostgreSQL database
+as the example. It is not run here yet. The K8up resources follow its
+documentation; the endpoint, the bucket and the Secret names are placeholders
+for what ADR-0030 and the External Secrets Operator will provide.
+
+The database pod says how it is dumped. K8up runs the command in the pod and
+stores its output as one file in the repository. `-Fc` is PostgreSQL's custom
+format, which `pg_restore` reads; `-Z0` leaves it uncompressed, so that restic
+can deduplicate between runs and does the compressing itself:
+
+```yaml
+# in the pod template of the PostgreSQL StatefulSet
+metadata:
+  annotations:
+    k8up.io/backupcommand: sh -c 'PGDATABASE="$POSTGRES_DB" PGUSER="$POSTGRES_USER" PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -Fc -Z0'
+    k8up.io/file-extension: .dump
+```
+
+The data volume is left out, because a file copy of a running server is not a
+backup: the claim gets the annotation `k8up.io/backup: "false"`.
+
+A backup on request is one resource; `kubectl apply` starts it:
+
+```yaml
+apiVersion: k8up.io/v1
+kind: Backup
+metadata:
+  name: before-teardown
+  namespace: myapp
+spec:
+  failedJobsHistoryLimit: 2
+  successfulJobsHistoryLimit: 2
+  backend:
+    repoPasswordSecretRef:
+      name: backup-repo
+      key: password
+    s3:
+      endpoint: https://s3.kind.local:9000
+      bucket: myapp
+      accessKeyIDSecretRef:
+        name: backup-s3
+        key: access-key
+      secretAccessKeySecretRef:
+        name: backup-s3
+        key: secret-key
+```
+
+A regular backup is a `Schedule` with the same `backend`:
+
+```yaml
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: nightly
+  namespace: myapp
+spec:
+  backend: {}            # as above
+  backup:
+    schedule: '0 2 * * *'
+  prune:
+    schedule: '0 4 * * 0'
+    retention:
+      keepLast: 5
+      keepDaily: 7
+```
+
+K8up lists what is in the repository as `Snapshot` resources
+(`kubectl -n myapp get snapshots`); the path of a snapshot is the name of the
+dump file.
+
+The restore is a Job. The first container fetches the newest dump from the
+repository, the second loads it into the running database:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: restore-db
+  namespace: myapp
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+      - name: dump
+        emptyDir: {}
+      initContainers:
+      - name: fetch
+        image: restic/restic            # version to be pinned
+        command: ["sh", "-c"]
+        # DUMP_FILE: the path shown by "kubectl get snapshots -o yaml"
+        args: ['restic dump --path "$DUMP_FILE" latest "$DUMP_FILE" > /dump/db.dump']
+        env:
+        - name: DUMP_FILE
+          value: /myapp-postgres.dump
+        - name: RESTIC_REPOSITORY
+          value: s3:https://s3.kind.local:9000/myapp
+        - name: RESTIC_PASSWORD
+          valueFrom: {secretKeyRef: {name: backup-repo, key: password}}
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: {secretKeyRef: {name: backup-s3, key: access-key}}
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: {secretKeyRef: {name: backup-s3, key: secret-key}}
+        volumeMounts:
+        - {name: dump, mountPath: /dump}
+      containers:
+      - name: load
+        image: postgres                 # same version as the database
+        command: ["sh", "-c"]
+        args: ['pg_restore --clean --if-exists --no-owner --exit-on-error -d "$PGDATABASE" /dump/db.dump']
+        env:
+        - name: PGHOST
+          value: postgres
+        - name: PGDATABASE
+          valueFrom: {secretKeyRef: {name: postgres, key: database}}
+        - name: PGUSER
+          valueFrom: {secretKeyRef: {name: postgres, key: username}}
+        - name: PGPASSWORD
+          valueFrom: {secretKeyRef: {name: postgres, key: password}}
+        volumeMounts:
+        - {name: dump, mountPath: /dump}
+```
+
+`pg_restore --clean --if-exists` drops the objects it is about to create, so the
+Job can run against an empty database after a rebuild as well as against a
+filled one, and `--exit-on-error` makes the Job fail instead of leaving a
+half-loaded database unnoticed. `--no-owner` gives the objects to the user that
+restores them. Single tables can be restored from the same dump with `-t`. Open
+points for the test: the exact name K8up gives the dump
+file, and the CA. Both K8up and restic have to trust the local root CA for the
+`https` endpoint; K8up has `backend.tlsOptions.caCert` with a mounted volume for
+that, restic has `--cacert`.
+
+**Decision.** K8up is the platform's backup operator, installed in
+`platformservices/`. It is chosen because it is:
+
+- **Tool-agnostic:** it backs up whatever a command in the pod writes to its
+  output, and any volume. PostgreSQL, MariaDB, MongoDB or a directory of files
+  are the same to it; no operator or add-on per database engine is needed.
+- **Lightweight:** one operator in the cluster. Backups run as jobs that exist
+  only while they work; there is no agent on every node.
+- **Declarative:** a backup is a `Backup` or `Schedule` resource in the
+  application's namespace, next to the application's other manifests.
+- **Open:** Apache-2.0 and a CNCF project, with restic as the repository format.
+  The backups stay readable with plain restic, without K8up and without a
+  cluster.
+
+The platform provides the operator, one bucket per namespace in the object store
+on the host (ADR-0030), and the credentials: the access key and the restic
+repository password are stored in Vault and delivered by the External Secrets
+Operator (ADR-0023). It also provides the restore Job shown above as a template.
+
+The platform does not back anything up by itself. Logs, metrics, traces and scan
+results are not backed up at all.
+
+**No cluster or deployment state is backed up:** no etcd snapshot, no copy of
+Deployments, Services, Secrets or other Kubernetes objects. A rebuilt cluster is
+deployed from git, not restored; only the data inside the databases comes from a
+backup.
+
+This is the main argument against Velero. Velero is built to save and restore
+the objects of a cluster together with its volumes, which is the part this setup
+does not need, and restoring objects next to a fresh deployment from git would
+give two sources for the same state. Its resource use on this host is the second
+argument. Also set aside: VolSync because it cannot give a
+consistent database copy on thick LVM volumes, KubeStash because of its licence.
+CloudNativePG is a PostgreSQL operator, not a backup service; an application
+that runs its database with it may use its backup resources against the same
+object store, but it is not installed by this decision.
+
+**Consequences.** Applications are responsible for their own backups. Each
+application that holds data worth keeping:
+
+- declares how its database is dumped, as the annotation on its pod;
+- decides when backups happen: a `Schedule`, a `Backup` before a planned
+  teardown, or both;
+- decides how long backups are kept, in the `prune` part of its `Schedule`;
+- brings its own restore Job, from the platform's template, and runs it when it
+  wants the data back: after a rebuild, or to return to an earlier state;
+- tests that its restore works.
+
+An application that does none of this loses its data with the cluster, as today.
+The application itself is never lost that way: it is deployed again from its
+manifests, and only then, if it wants, restores its data.
+Data written after the last backup is lost in any case.
+
+What the platform gains is one small operator and one way of doing backups for
+every database engine. What it gives up is symmetry and comfort: the backup is a
+K8up resource, but the restore of a database is a plain Job that talks to the
+repository itself, because K8up's `Restore` handles volume backups only. Dumps
+give no point-in-time recovery. The backups sit on the same disk as the data, so
+this protects against rebuilding the cluster and the volume group, not against
+losing the laptop.
+
+The example in the context has to be shown working with a test application
+before the status changes to Accepted.
+
+## ADR-0030: RustFS as the object store for backups
+
+**Date:** 2026-09-30 · **Status:** Proposed
+
+**Context.** ADR-0029 needs a small S3-compatible object store that exists
+before the cluster and outlives it. It runs in Docker Compose on the host, like
+Harbor, Keycloak and Vault, under the same rules: as the local user without
+`sudo`, a certificate from the local CA, a `*.kind.local` name through
+`hosts.sh` and `cluster/host-services-dns.sh`, data in a git-ignored `out/`
+directory. Its clients are restic (K8up) and later Barman Cloud
+(CloudNativePG). MinIO, the usual choice, is out: its community repository was
+archived on 2026-04-25.
+
+The candidates that are maintained today. Memory use is taken from the projects
+or from reports, not measured here.
+
+| | RustFS | SeaweedFS | Garage | Versity S3 Gateway |
+| --- | --- | --- | --- | --- |
+| **What it is** | MinIO-like object server in Rust | master, volume server, filer and S3 gateway; `weed mini` runs them as one process | geo-distributed object store in Rust | stateless S3 gateway in front of a directory |
+| **Licence** | Apache-2.0 | Apache-2.0 | AGPL-3.0 | Apache-2.0 |
+| **Maturity** | 1.0.0 on 2026-09-16, open source since July 2025 | more than ten years, near-weekly releases | several years, v2.3.0 | active, smaller user base |
+| **Single node** | supported mode | supported, `weed mini` is meant for it | works with `replication_factor = 1`, which its docs call test-only | yes, it has no cluster mode |
+| **Administration** | web console, MinIO-style users and keys | admin UI, keys in a config file or by shell | command line only, plus a layout step at first start | accounts by command line or file |
+| **Footprint** | not measured | not measured | about 100 MB idle reported | not measured; one Go binary |
+| **Data on disk** | own format | own volume files | own blocks and metadata database | plain files, readable without the gateway |
+
+Ceph RGW is not a candidate at this size.
+
+**Decision.** RustFS, single node, one container in Docker Compose in a new
+`objectstore/` directory with a `setup-host.sh` like the other host services.
+Buckets and access keys are created by that script, one pair per namespace, and
+the keys go into Vault. SeaweedFS is the fallback.
+
+The reasons: RustFS is the closest replacement for what MinIO was, so the many
+S3 clients tested against MinIO have the best chance of working unchanged, and
+Barman Cloud names MinIO as its only verified S3-compatible store. It has a
+console for looking into buckets, single node is a supported mode rather than a
+test setting, and the licence is permissive. SeaweedFS is more proven, but it is
+four components behind one command, which is more to understand and to debug
+for a store that holds a few dumps. Garage is the smallest, but it has no
+console and treats one node as a test setup. The Versity gateway is the simplest
+idea; it stays the option if plain files on disk turn out to matter more than a
+console.
+
+**Consequences.** One more host service: it has to be running for backups and
+restores, and its behaviour after a reboot needs the same attention as Harbor's
+and Vault's. The clients only know an endpoint and a key pair, so changing the
+product later means changing the Compose file and copying the buckets across.
+
+RustFS is two weeks past its first stable release. For backups that is the main
+risk, accepted here because the data is dev data and the fallback is cheap.
+Before the status changes to Accepted, an update-setup plan has to show, with
+pinned versions: a restic backup and restore through K8up, a Barman Cloud backup
+and recovery, TLS with the certificate from the local CA, the container running
+as the local user, and the memory it actually uses.

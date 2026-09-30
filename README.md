@@ -36,7 +36,7 @@ cluster/cluster.sh up         # kind cluster, Gateway API CRDs, cloud-provider-k
 ./deploy.sh                   # platform services, then test applications
 cluster/cluster.sh down       # delete the cluster (the PKI and the LVM volume group stay)
 
-registry/setup-host.sh        # optional: Harbor (sudo only for its ./prepare step)
+registry/setup-host.sh        # optional: Harbor (no sudo; re-run after a reboot to start it again)
 registry/proxy-cache.sh       # once: Harbor mirrors Docker Hub, quay.io, ghcr.io, registry.k8s.io, public.ecr.aws
 registry/kind-trust.sh        # after every "cluster.sh up" if Harbor is used
 
@@ -437,7 +437,7 @@ Harbor runs in Docker Compose on the host, so images survive
 anything that trusts the root CA trusts Harbor.
 
 ```bash
-registry/setup-host.sh              # certificate, installer, config, start (sudo only for ./prepare)
+registry/setup-host.sh              # certificate, installer, config, start; as your user, no sudo
 registry/proxy-cache.sh             # once, and after changing mirrors.tsv or the Docker Hub credentials
 registry/kind-trust.sh              # after every cluster.sh up: hosts entry, CA and containerd config in the nodes
 docker compose -f registry/out/harbor/docker-compose.yml ps     # runs as your user
@@ -458,14 +458,38 @@ ports are set in `versions.env` (`HARBOR_HTTP_PORT`, `HARBOR_HTTPS_PORT`);
 changing them there and re-running `registry/setup-host.sh` re-renders Harbor's
 config, which also re-runs `prepare`.
 
-Privileges, worth knowing:
-- **Only `prepare` needs root.** It runs a `--privileged` container with your
-  whole filesystem mounted at `/hostfs` and writes the configs and secrets as
-  root. It runs once, and again only when `harbor.yml` changes.
+Privileges, worth knowing. The rule for this setup is: work as the local user and
+its group, root only where there is no way around it.
+- **`registry/setup-host.sh` runs as your user and never calls `sudo`.** It needs
+  membership in the `docker` group, nothing else.
+- **`prepare` is root inside a container, not on your shell.** Harbor's `prepare`
+  starts a `--privileged` container with your whole filesystem mounted at
+  `/hostfs` and writes the configs and secrets as root (mode 0640, owner root or
+  uid 10000). It runs once, and again only when `harbor.yml` or a `prepare` flag
+  (`HARBOR_WITH_TRIVY`) changes.
+- **The env files get your group.** Compose itself, running as you, reads
+  `registry/out/harbor/common/config/*/env`. Every `prepare` run resets them to
+  `root:root 0640`, so the script then sets their group to yours and adds group
+  read. It does that from a container as well, because only root may change the
+  group of root's files. The owners stay untouched, because Harbor's processes
+  read the neighbouring files as uid 10000.
 - **Everything else runs as your user:** `up`, `stop`, `restart`, `ps`, `logs`.
-  After a `prepare`, the script re-adds group read on the four env files that
-  Compose itself reads; the file owners stay untouched, because Harbor's
-  processes read them as uid 10000.
+
+Two things that go wrong, and the fix for both is to re-run
+`registry/setup-host.sh`:
+- **`docker compose` fails with `open …/common/config/jobservice/env: permission
+  denied`.** The env files are `root:root` again: `prepare` was run outside the
+  script (for example `sudo ./prepare` by hand), which skips the group step. The
+  script notices unreadable env files on every run and repairs them. Check with
+  `ls -l registry/out/harbor/common/config/*/env`; the group must be yours.
+- **Harbor is down after a reboot,** with every container but `harbor-log` in
+  `Exited (128)`. All of them log to `harbor-log` through syslog on
+  `127.0.0.1:1514`, and Docker starts them at boot before it listens (`failed to
+  initialize logging driver … connection refused` in `journalctl -u docker`);
+  `restart: always` does not retry a failed start. The script's
+  `docker compose up -d` starts them in the right order. Vault needs its own
+  re-run after a reboot too (`vault/setup-host.sh`, to unseal).
+
 - **At runtime Harbor is unprivileged:** no container is privileged, and eight of
   nine run as non-root users. Running the installation entirely without root is
   an open upstream issue (goharbor/harbor#17494).
@@ -600,11 +624,11 @@ password has been typed instead of before. The OIDC `redirect_uri` is always
 `https://argocd.kind.local/auth/callback`, which is what the realm registers.
 
 **Harbor** is switched over by `registry/oidc-setup.sh`. It needs the root CA in
-Harbor's custom certificate directory first, which `./prepare` created as root:
+Harbor's custom certificate directory first. `registry/setup-host.sh` puts it
+there through `prepare` (as `storage_ca_bundle.crt`), so no manual root copy is
+needed:
 
 ```bash
-sudo cp pki/out/root-ca.crt \
-  registry/out/harbor/common/config/shared/trust-certificates/kind-dev-root-ca.crt
 # proxy as well: nginx resolves its upstreams once at startup, so restarting only core
 # and jobservice leaves it pointing at their previous container addresses (API calls
 # then land on the wrong service and fail with "should start with 'Harbor-Secret'")
@@ -760,8 +784,9 @@ points:
   their logical volumes stay on the host when the cluster is deleted;
 - the loop file sits on ZFS here, so it's copy-on-write on copy-on-write: fine
   for dev, but not a performance reference;
-- Harbor's `prepare` is a privileged step (see above), and `registry/kind-trust.sh`
-  has to run after every cluster creation.
+- Harbor's `prepare` is a privileged container (see above), Harbor does not come
+  back by itself after a reboot, and `registry/kind-trust.sh` has to run after
+  every cluster creation.
 
 ## Status of the 2023 suggestions
 
