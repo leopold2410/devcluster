@@ -1065,8 +1065,8 @@ Such an application needs a platform service with these properties:
 - The backups lie outside the cluster and outside the TopoLVM volume group.
 - It fits a 16 GB laptop that already runs Harbor, Keycloak and Vault.
 
-The current options, compared. None of them is tested here yet; the statements
-come from the projects' documentation.
+The current options, compared. The statements come from the projects'
+documentation; only K8up was tried here.
 
 | | K8up | CloudNativePG + Barman Cloud plugin | VolSync | Velero | KubeStash |
 | --- | --- | --- | --- | --- | --- |
@@ -1075,16 +1075,17 @@ come from the projects' documentation.
 | **What it backs up** | volumes, and the output of a command run in the pod | PostgreSQL only: base backups and the WAL | volumes | cluster objects and volumes | volumes and databases through add-ons |
 | **Database consistency** | yes, through a dump command set as a pod annotation | yes, with point-in-time recovery | no: file copy; snapshots would need a thin pool | only through hooks written per application | yes, through the add-ons |
 | **Runs in the cluster** | one operator; a job per backup | one operator and the plugin; backup runs in the database pod | one operator; a job per sync | a server and an agent on every node; 1.5 to 2.2 GB peak measured by the project | one operator and add-on jobs |
-| **Licence, state** | Apache-2.0, CNCF sandbox, restic inside, released this month | Apache-2.0, CNCF; plugin replaces the in-tree backup that is removed in 1.30 | AGPL-3.0, active | Apache-2.0, active | commercial AppsCode product with its own licence |
+| **Licence, state** | Apache-2.0, CNCF sandbox, restic inside, v2.16.0 from July 2026 | Apache-2.0, CNCF; plugin replaces the in-tree backup that is removed in 1.30 | AGPL-3.0, active | Apache-2.0, active | commercial AppsCode product with its own licence |
 
 Stash (stash.run) is not in the table, because KubeStash is its successor
 ("Stash 2.0") with a new API, and database backup was an Enterprise feature of
 Stash. All five need an S3-compatible object store; ADR-0030 selects it.
 
 What working with K8up looks like for an application, with a PostgreSQL database
-as the example. It is not run here yet. The K8up resources follow its
-documentation; the endpoint, the bucket and the Secret names are placeholders
-for what ADR-0030 and the External Secrets Operator will provide.
+as the example. The annotation, a `Backup` and the restore Job were run on
+2026-09-30 in a throwaway test (update-setup-09); the `Schedule` was not. The
+endpoint, the bucket and the Secret names are placeholders for what ADR-0030
+and the External Secrets Operator will provide.
 
 The database pod says how it is dumped. K8up runs the command in the pod and
 stores its output as one file in the repository. `-Fc` is PostgreSQL's custom
@@ -1209,11 +1210,12 @@ spec:
 Job can run against an empty database after a rebuild as well as against a
 filled one, and `--exit-on-error` makes the Job fail instead of leaving a
 half-loaded database unnoticed. `--no-owner` gives the objects to the user that
-restores them. Single tables can be restored from the same dump with `-t`. Open
-points for the test: the exact name K8up gives the dump
-file, and the CA. Both K8up and restic have to trust the local root CA for the
-`https` endpoint; K8up has `backend.tlsOptions.caCert` with a mounted volume for
-that, restic has `--cacert`.
+restores them. Single tables can be restored from the same dump with `-t`. The
+dump file is named after the namespace, the container and the extension:
+`/myapp-postgres.dump`. Both K8up and restic have to trust the local root CA for
+the `https` endpoint: K8up with `backend.tlsOptions.caCert` and a mounted
+volume, restic with `--cacert`; both are left out above for brevity and are in
+update-setup-09.
 
 **Decision.** K8up is the platform's backup operator, installed in
 `platformservices/`. It is chosen because it is:
@@ -1302,7 +1304,7 @@ or from reports, not measured here.
 | **Maturity** | 1.0.0 on 2026-09-16, open source since July 2025 | more than ten years, near-weekly releases | several years, v2.3.0 | active, smaller user base |
 | **Single node** | supported mode | supported, `weed mini` is meant for it | works with `replication_factor = 1`, which its docs call test-only | yes, it has no cluster mode |
 | **Administration** | web console, MinIO-style users and keys | admin UI, keys in a config file or by shell | command line only, plus a layout step at first start | accounts by command line or file |
-| **Footprint** | not measured | not measured | about 100 MB idle reported | not measured; one Go binary |
+| **Footprint** | 104 to 151 MiB measured here | not measured | about 100 MB idle reported | not measured; one Go binary |
 | **Data on disk** | own format | own volume files | own blocks and metadata database | plain files, readable without the gateway |
 
 Ceph RGW is not a candidate at this size.
@@ -1330,7 +1332,10 @@ product later means changing the Compose file and copying the buckets across.
 
 RustFS is two weeks past its first stable release. For backups that is the main
 risk, accepted here because the data is dev data and the fallback is cheap.
-Before the status changes to Accepted, an update-setup plan has to show, with
-pinned versions: a restic backup and restore through K8up, a Barman Cloud backup
-and recovery, TLS with the certificate from the local CA, the container running
-as the local user, and the memory it actually uses.
+
+A throwaway test on 2026-09-30 (update-setup-09) showed RustFS 1.0.0 running as
+the local user, with TLS from the local CA, a key limited to one bucket, and a
+restic backup and restore through K8up. OIDC discovery against Keycloak
+validated, so the console can use the central login; the login itself is not
+tested. Still open before the status changes to Accepted: the installation by
+update-setup-09, the Keycloak login, and Barman Cloud against it.
