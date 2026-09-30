@@ -1613,3 +1613,180 @@ it, and the console uses the Keycloak login. Console rights come from the token
 claim `policy`, which has to name stored policies; the built-in ones are not
 accepted there. Not shown: Barman Cloud against RustFS, which matters only once
 an application uses CloudNativePG.
+
+## ADR-0031: Falco for runtime monitoring, without Falcosidekick
+
+**Date:** 2026-09-30 · **Status:** Proposed
+
+**Context.** The security scanning of update-setup-08 looks at what is stored
+and what is declared: Trivy scans images in Harbor and in the cluster, Kyverno
+is planned to warn at admission. Nothing looks at what a container does once it
+runs: a shell opened in a pod, a read of a credential file, an unexpected
+outgoing connection. That is the job of a runtime scanner, which watches system
+calls in the kernel and matches them against rules.
+
+What the platform needs for now is a monitoring tool, not an enforcing one: it
+should show what happens at run time, and it should not stop anything. The
+conditions:
+
+- **Monitoring, not enforcement.** Nothing is killed or blocked, in line with
+  the scanning so far: no component of it can stop the cluster. The ability to
+  enforce is not a reason to choose a tool, and a tool built around enforcement
+  is the wrong fit.
+- **Findings are visible on a dashboard.** Grafana is preferred, because it is
+  there, has the Keycloak login and holds the metrics, logs and traces the
+  findings relate to. Another dashboard technology is acceptable if it is
+  clearly better.
+- **It fits the laptop.** About 3 GB of memory are free with everything running.
+
+Four open-source runtime scanners for Kubernetes were compared. All are
+Apache-2.0 and run as a DaemonSet. The statements come from the projects'
+charts, repositories and documentation, read on 2026-09-30; none of the four was
+installed.
+
+| | Falco | Tetragon | Tracee | KubeArmor |
+| --- | --- | --- | --- | --- |
+| **Project** | CNCF graduated | Part of Cilium, which is CNCF graduated | Aqua Security, not in the CNCF | CNCF sandbox |
+| **Version, last release** | 0.45.0, 2026-09-21 (chart 9.2.0) | 1.7.1, 2026-08-25 | 0.24.1, 2025-11-19; commits continue, no release for ten months | 1.7.4, 2026-07-06 |
+| **Built for** | Detecting and reporting suspicious behaviour | Observing processes, files and network per workload, and stopping them in the kernel | Detection and forensics: recording events in detail | Restricting what a workload may do |
+| **Detection out of the box** | The largest rule library: shells in containers, reads of credentials, reverse shells, miners, escapes | Process start and exit only. Everything else needs a `TracingPolicy`; a policy library exists as examples | Built-in signatures and a default policy | None as detection; policies describe what is allowed or audited |
+| **How rules are written** | YAML rules with a condition language over system call fields | `TracingPolicy` resources naming kernel functions, arguments and selectors; closest to the kernel, most to learn | Policies as resources selecting events and signatures; own signatures in Go or Rego | `KubeArmorPolicy` resources per workload: process, file, network, capabilities |
+| **Enforcement** | No; reports only (a separate project, Talon, reacts) | Yes, in the kernel: kill the process or override the call | No; reports only | Yes, that is its purpose; an audit-only posture exists |
+| **Kernel mechanism** | eBPF on system calls (modern eBPF needs BTF); kernel module as an alternative | eBPF on kprobes, tracepoints and LSM hooks, filtered in the kernel | eBPF on system calls and kernel functions | Linux security modules: BPF-LSM or AppArmor, plus eBPF for visibility |
+| **Fit for this host and kind** | The modern eBPF driver fits: kernel 7.0 with BTF, nothing to build or load | Fits for the same reason | Fits for the same reason; the pod is privileged with the host's process namespace | Poor: the host's active security modules are `lockdown,capability,landlock,yama,apparmor,ima,evm`, without `bpf`. KubeArmor would fall back to AppArmor, which needs extra steps in kind and changes on the host |
+| **Way onto a dashboard** | Findings as JSON on stdout, which the collector ships to Loki; its own Prometheus metrics with a counter per rule and priority; the chart ships a Grafana dashboard. Optionally Falcosidekick, which adds many other outputs and its own UI | Events as JSON on stdout, to Loki the same way; Prometheus metrics on port 2112. No dashboard of findings, because there are no findings without policies | JSON events on stdout or to a webhook; Prometheus metrics | A relay service that clients subscribe to; alerts on stdout only when switched on. The least direct of the four |
+| **Chart defaults** | 512 Mi requested, 1 Gi limit per instance | No requests or limits set; privileged | No requests or limits set; privileged | An operator that installs the rest |
+
+All three eBPF scanners share the kind problem described below: one kernel, so
+every instance sees the whole machine. Tetragon filters by pod inside the
+kernel, which may handle it best, but this was not tried for any of them.
+
+Published overhead figures are left out: they are vendor benchmarks, and they
+say little about a laptop.
+
+How they fit the three conditions:
+
+- **Falco** fits best. It is made for exactly "report, do not block", and it
+  brings findings without a rule being written, which is what a dashboard of
+  findings needs. Its cost is the highest default memory.
+- **Tetragon** is the strongest alternative and probably the lighter one. On the
+  way to a dashboard it is Falco's equal: JSON on stdout and Prometheus metrics,
+  both of which the existing collector picks up. The difference is what arrives
+  there. Out of the box it shows which processes start, not which behaviour is
+  suspicious; getting findings means writing and maintaining tracing policies.
+  It becomes the better choice if the goal shifts from "show findings" to "see
+  and control what workloads do".
+- **Tracee** is closest to Falco in what it reports and reaches a dashboard the
+  same way, but its last release is ten months old.
+- **KubeArmor** solves another problem, enforcement per workload, and is the
+  only one that does not fit this host without changes.
+
+More on Falco, from its chart: BTF is at `/sys/kernel/btf/vmlinux` on this
+host; the default driver is `auto`; the metrics endpoint (port 8765) is off by
+default and has counters per rule when switched on.
+
+Three things follow from kind, where every node is a container on one kernel:
+
+- **No kernel module.** The nodes cannot load one, and the host should not get
+  one for a dev cluster. The modern eBPF driver needs nothing built or loaded.
+- **Every Falco instance sees the whole machine.** eBPF programs attach to the
+  kernel, not to a node. An instance on each of the three nodes would therefore
+  see every system call three times, and also those of the host's own
+  processes and of Harbor, Keycloak, Vault and RustFS. Each instance can only
+  name the containers of its own node, because it reads container metadata from
+  that node's containerd. This is expected from how eBPF works and has to be
+  measured; it decides how Falco is deployed.
+- **The desktop is in view.** Rules for the "host" would fire on the developer's
+  own shell and browser. That is noise, and it is more observation of the laptop
+  than a dev cluster should do.
+
+For getting Falco's findings onto a dashboard there are four ways:
+
+| Way | Finding |
+| --- | --- |
+| Falco writes each finding as JSON to stdout; the OpenTelemetry Collector already ships pod logs to Loki | Needs no new component. Findings are log lines in Falco's log stream, selected in Grafana by their JSON fields (rule, priority, pod) |
+| Falco's own Prometheus metrics, scraped by the collector like other annotated pods | Needs no new component. Counters per rule and priority, for rates and totals |
+| Falcosidekick between Falco and Loki and Prometheus | One more service. Findings become a labelled stream of their own; it can also send to chat, Alertmanager and many other targets |
+| Falcosidekick UI | A dashboard made for Falco findings, with Redis behind it: another UI, another login, more memory |
+
+The first two together give what the third gives for a dashboard, through the
+path that every other workload already uses (ADR-0019). Falcosidekick earns its
+place when findings have to go somewhere else than Grafana.
+
+**Decision.** Falco, without Falcosidekick.
+
+The need for now is monitoring, not enforcement, and that decides both halves.
+Falco is the tool built for monitoring: it detects and reports, and it has the
+largest ruleset out of the box, which gives findings from the first day. That
+ruleset is also what keeps the effort low: the rules are written and updated by
+the Falco project, and what is maintained here is only a short file of
+exceptions. With the other tools the rulebase itself would have to be written
+and kept up to date in this repository. Tetragon and KubeArmor are built
+around enforcement, which is not needed yet and would bring policies to write
+and the risk of stopping workloads; Tracee monitors too, but is released less
+often. Falcosidekick is left out for the same reason: monitoring only needs the
+findings on a dashboard, and they get there through the telemetry path the
+platform already has. Routing findings to other systems is a step towards
+reacting to them, and belongs to a later decision.
+
+Falco is installed as a platform service in `platformservices/falco/`:
+
+- **Driver:** `modern_ebpf`, fixed, not `auto`. Least-privileged mode
+  (capabilities instead of a privileged pod) if it works inside a kind node.
+- **Deployment:** a DaemonSet, as in production, with each instance reporting
+  only what it can name: findings without a resolved pod are dropped by a rule
+  condition. That removes the duplicates, the host's processes and the host-side
+  services in one step. If the measurement shows that this does not hold, the
+  fallback is one instance on one node.
+- **Rules:** the stable default ruleset as shipped in the pinned image, plus one
+  local rules file in the repository for exceptions. No download of rule updates
+  at run time, so a rebuild gives the same behaviour.
+- **Findings as logs:** Falco writes JSON to stdout. The collector ships it to
+  Loki like any pod log; nothing is configured for Falco there.
+- **Findings as metrics:** Falco's metrics endpoint is switched on with the rule
+  counters, and the pod gets the `prometheus.io/scrape` annotation, so the
+  collector on the same node scrapes it into Prometheus.
+- **Dashboard:** Grafana, one dashboard *Runtime findings* as a file in the
+  repository, like the other platform dashboards: findings over time by
+  priority and the top rules from the metrics, the findings themselves from
+  Loki. No other dashboard technology: the Falcosidekick UI would be the only
+  candidate, and it adds a login and Redis for a view Grafana can give.
+- **Falcosidekick is left out** until findings have to be sent somewhere else,
+  for example to a chat or to Alertmanager. Adding it later changes one Falco
+  output setting.
+- **If enforcement is wanted later,** that is a new decision, and Tetragon is
+  the candidate to look at first.
+- **Report only:** no response engine (Falco Talon), no alert routing.
+- **Resources:** lower requests than the chart's 512 Mi per instance, set from
+  what is measured.
+- **Images** come through the Harbor mirrors like all others.
+
+The Kubernetes audit log as a second source for Falco (the `k8saudit` plugin) is
+left out: it needs an audit webhook on the API server and therefore a changed
+cluster configuration.
+
+**Consequences.** The platform gets runtime monitoring, and only that: Falco
+shows what happens and prevents nothing. It is the third layer of scanning:
+images at rest (Trivy), manifests at admission (Kyverno, planned), behaviour at
+run time (Falco). A shell in a pod or a read of a service account token shows up in
+Grafana within seconds, and can be followed from the dashboard to the pod's logs
+and traces.
+
+The costs: one more privileged component on every node that reads all system
+calls, and memory for three instances, not yet measured. Without Falcosidekick
+the findings share a log stream with Falco's own messages and have no labels of
+their own in Loki; the dashboard separates them by their JSON fields. The
+default rules fire on normal platform behaviour (operators that read secrets,
+jobs that start shells), so a first round of exceptions is part of the
+installation, not an afterthought. Less maintenance is not none: a new Falco
+version can bring new or changed rules, so the exceptions have to be looked at
+with each upgrade. Findings are not deduplicated or routed;
+nobody is notified. Falco stays blind to the host-side services, which run
+outside the cluster, and to anything the rules do not describe.
+
+Before the status changes to Accepted, an update-setup plan has to show: the
+modern eBPF driver starting in a kind node; how many times one event is reported
+with three instances and whether the pod condition removes the rest; that
+nothing from the desktop or the host services is reported; a test finding (a
+shell in a pod) arriving in Loki through the collector and in the rule counters
+in Prometheus; the dashboard; and the memory actually used.
