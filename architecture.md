@@ -30,6 +30,141 @@ one host, one cluster, everything reproducible from this repository.
 - **No public DNS or CA:** names end in `.kind.local`, certificates come from a
   local CA.
 
+## C4 system context
+
+The cluster is the system in focus. Everything it needs from outside runs on the
+same host but outside the cluster, so that it exists before the cluster and
+survives a rebuild. The container diagram below opens up both sides.
+
+```mermaid
+C4Context
+    title System context: kind development platform
+
+    Person(dev, "Developer", "Deploys and tries out workloads; logs in through Keycloak")
+    Person(admin, "Platform admin", "Builds and operates the platform from this repository; member of platform-admins")
+    Person(localadmin, "Local admin", "Owner of the host: root on it, and the local break-glass accounts of every service")
+
+    Enterprise_Boundary(host, "Host (Ubuntu, Docker, systemd)") {
+        System(cluster, "kind cluster dev", "Kubernetes 1.36: platform services and applications")
+        System_Ext(lb, "cloud-provider-kind", "LoadBalancer IPs and the default Ingress, as Envoy containers")
+        System_Ext(harbor, "Harbor", "Container registry and pull-through cache")
+        System_Ext(keycloak, "Keycloak", "Identity provider, realm localdev")
+        System_Ext(vault, "Vault", "Secrets store")
+        System_Ext(rustfs, "RustFS", "Object store for backups")
+        System_Ext(storage, "Host storage", "lvmd and the LVM volume group topolvm-vg")
+        System_Ext(pki, "Local PKI", "Root CA and intermediates, files in pki/out")
+    }
+
+    System_Ext(upstreams, "Upstream registries", "Docker Hub, quay.io, ghcr.io, registry.k8s.io and others")
+    System_Ext(github, "GitHub", "This repository, read by Argo CD")
+
+    Rel(dev, cluster, "Deploys and observes", "kubectl, k9s, web UIs")
+    Rel(dev, lb, "Reaches applications and UIs", "HTTPS")
+    Rel(dev, keycloak, "Logs in", "HTTPS")
+    Rel(dev, harbor, "Pushes images", "HTTPS")
+    Rel(dev, github, "Pushes manifests", "git")
+    Rel(admin, cluster, "Creates, deploys, operates", "scripts, kubectl")
+    Rel(admin, harbor, "Sets up and administers", "scripts, web UI")
+    Rel(admin, keycloak, "Maintains the realm", "scripts, web UI")
+    Rel(admin, vault, "Sets up, manages secrets", "scripts, web UI, CLI")
+    Rel(admin, rustfs, "Sets up, provides buckets", "scripts, web UI, CLI")
+    Rel(localadmin, storage, "Sets up and removes", "sudo")
+    Rel(localadmin, pki, "Creates the CA", "script")
+
+    Rel(lb, cluster, "Forwards traffic, watches Services", "TCP, Kubernetes API")
+    Rel(cluster, harbor, "Pulls and scans images", "HTTPS")
+    Rel(cluster, keycloak, "Validates logins", "OIDC")
+    Rel(cluster, vault, "Reads secrets", "HTTPS")
+    Rel(vault, cluster, "Reviews login tokens", "TokenReview")
+    Rel(cluster, rustfs, "Backs up and restores", "S3 over HTTPS")
+    Rel(cluster, storage, "Creates and mounts volumes", "gRPC socket, /dev")
+    Rel(cluster, pki, "Signs with the issuing CA", "Secrets from files")
+    Rel(cluster, github, "Reads application manifests", "git over HTTPS")
+    Rel(cluster, upstreams, "Fallback pulls", "HTTPS")
+    Rel(harbor, upstreams, "Fetches and caches", "HTTPS")
+    Rel(harbor, keycloak, "Login", "OIDC")
+    Rel(vault, keycloak, "Login", "OIDC")
+    Rel(rustfs, keycloak, "Login", "OIDC")
+```
+
+The three actors are roles, not three people: on this laptop one person has all
+of them, and the Keycloak user `dev` is a member of `platform-admins`.
+
+| Actor | Identity | Rights |
+| --- | --- | --- |
+| Developer | A Keycloak user, in `platform-users` or in no group | Read-only or limited in every UI (see *How group membership becomes rights*) |
+| Platform admin | A Keycloak user in `platform-admins`; runs the scripts of this repository as the local user | Administrator in every UI; cluster-admin through the kubeconfig |
+| Local admin | No Keycloak identity: `root` on the host through `sudo`, and the local accounts listed under *Where the credentials live* | Everything; the way back in when the Keycloak path is broken |
+
+`kubectl` makes no difference between developer and platform admin yet: there is
+one kubeconfig with a cluster-admin client certificate. Logging in to the API
+server through Keycloak is the postponed update-setup-04.
+
+### Interfaces between the cluster and the host systems
+
+| ID | From → to | Interface | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| S1 | cloud-provider-kind → cluster | Kubernetes API, through the Docker socket and the `kind` network | Give a `LoadBalancer` Service an address; serve an `Ingress` of class `cloud-provider-kind` | Watches Services and Ingresses and starts one Envoy container (`kindccm-*`) per Service and per namespace with Ingresses |
+| S2 | cloud-provider-kind → cluster | TCP from the Envoy containers to the node ports, on the `kind` network (`172.21.0.0/16`) | Reach Argo CD, Grafana and the test applications from the host; reach the Istio ingress gateway | The only way traffic enters the cluster. Addresses can change when the cluster is recreated; `hosts.sh` writes them to `/etc/hosts` |
+| S3 | Cluster → Harbor | OCI registry API, `https://harbor.kind.local:3443/v2/`, from containerd on every node | Pull the platform's and the applications' images; pull own images from `library` | Harbor is a mirror for every upstream registry (`certs.d/<registry>/hosts.toml`); image names stay unchanged. Set up per cluster by `registry/kind-trust.sh` |
+| S4 | Cluster → Harbor | The same registry API, from the Trivy Operator's scan jobs | Scan the images of running workloads | The jobs fetch images through Harbor's proxy projects; pods resolve the name through CoreDNS (`cluster/host-services-dns.sh`) |
+| S5 | Cluster → Keycloak | OIDC, `https://keycloak.kind.local:8443/realms/localdev`: discovery, token and JWKS endpoints | Log people in to Argo CD and Grafana; validate their tokens | Back-channel calls from `argocd-server` and Grafana to the kind gateway; the certificate is checked against the local root CA |
+| S6 | Cluster → Vault | Vault HTTP API, `https://vault.kind.local:8200/v1/`: `auth/kubernetes/login`, `secret/data/*` | Turn a secret in Vault into a Kubernetes Secret; refresh it when it changes | The External Secrets Operator logs in with a short-lived token of the service account `vault-auth` and reads KV v2 |
+| S7 | Vault → cluster | Kubernetes API `TokenReview`, `https://dev-control-plane:6443`, on the `kind` network | Check that a login token presented by the cluster is genuine | Vault stores no reviewer token; it reviews each login with the token it was given (ADR-0024). The reason Vault joins the `kind` network |
+| S8 | Cluster → RustFS | S3 API, `https://s3.kind.local:9000`, one bucket and key per namespace | Back up a database dump; prune old backups; read a dump back for a restore | restic, started by K8up's jobs and by the applications' restore Jobs; repositories are encrypted with a password from Vault |
+| S9 | Cluster → host storage | gRPC over the Unix socket `/run/topolvm/lvmd.sock`, mounted into every node | Create, resize and delete the volume of a claim | TopoLVM in the cluster asks `lvmd` on the host, which manages logical volumes in `topolvm-vg` |
+| S10 | Cluster → host storage | Block devices under `/dev`, mounted into every node | Mount a volume into a pod | The logical volume appears as a device on the host and, through the mount, in the node |
+| S11 | Cluster → local PKI | Files from `pki/out`, written into Secrets and a ConfigMap by `platformservices/deploy.sh` | Issue certificates for Ingresses; issue mesh certificates; distribute the root certificate | A deploy-time interface: cert-manager gets the issuing CA, Istio its own intermediate, trust-manager the root |
+| S12 | Cluster → GitHub | git over HTTPS, `https://github.com/leopold2410/devcluster.git` | Deploy `backup-demo`; run its backup and restore by sync | Argo CD reads application manifests from the public repository; it deploys what is pushed |
+| S13 | Cluster → upstream registries | OCI registry API over HTTPS | Pull an image while Harbor is down; fetch the vulnerability database | The fallback of S3 (`server` in `hosts.toml`). The Trivy server gets its database from `mirror.gcr.io`; whether that request goes directly or through Harbor's proxy project was not checked |
+
+### Interfaces between the host systems
+
+| ID | From → to | Interface | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| H1 | Harbor → upstream registries | OCI registry API over HTTPS, one proxy-cache project per registry | Fetch an image on its first pull and cache it | Optional Docker Hub credentials raise the rate limit; unused artifacts are removed after 7 days |
+| H2 | Harbor → Keycloak | OIDC, client `harbor` | Log people in to the Harbor UI; decide administrator rights from the `groups` claim | Users are onboarded on first login |
+| H3 | Vault → Keycloak | OIDC, client `vault` | Log people in to the Vault UI and CLI; grant policy `admin` to `platform-admins` | Configured by Terraform in `vault/config` |
+| H4 | RustFS → Keycloak | OIDC, client `rustfs` | Log people in to the RustFS console; take their policies from the claim `policy` | RustFS only calls Keycloak because its origin is listed in `RUSTFS_OUTBOUND_ALLOW_ORIGINS` |
+| H5 | Harbor, Keycloak, Vault, RustFS → local PKI | Files: a server certificate per service, signed by the issuing CA | Serve HTTPS that everything trusting the root CA accepts | Issued by each service's `create-cert.sh`; renewed when less than 30 days remain |
+| H6 | RustFS → Vault (through `objectstore/setup-host.sh`) | Vault CLI in the Vault container, `vault kv put secret/backup/<namespace>` | Hand a namespace its bucket key and repository password | A script, not a running connection: it writes what S6 later delivers to the namespace |
+
+### Web interfaces for people
+
+All of them use HTTPS with certificates from the local CA; the browser has to
+trust the root certificate once (see `README.md`, *Browser access*).
+
+| ID | Interface | Who | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| W1 | Keycloak login, `https://keycloak.kind.local:8443/realms/localdev` | Developer, platform admin | Log in once for every UI below | The page every *Login with Keycloak* button leads to; one session covers all services |
+| W2 | Keycloak account console, `…/realms/localdev/account` | Developer, platform admin | Change the own password; see sessions | The user's own view of the realm |
+| W3 | Keycloak admin console, `https://keycloak.kind.local:8443/admin` | Local admin (`admin`, realm `master`) | Look at users, groups, clients and sessions; debug a login | Changes belong into `identity/realm/localdev.yaml`; what is clicked here is overwritten by the next `identity/setup-host.sh` |
+| W4 | Argo CD, `https://argocd.kind.local` | Developer (read only), platform admin (`role:admin`), local admin (`admin`, form login) | See what is deployed and whether it is in sync; sync an application; start the demo's backup or restore | Reached through the default Ingress |
+| W5 | Grafana, `https://grafana.kind.local` | Developer (`Editor` or `Viewer`), platform admin (`GrafanaAdmin`), local admin (`admin`, login form) | Explore metrics, logs and traces and jump between them; build dashboards | Data sources for Prometheus, Loki and Tempo are provisioned |
+| W6 | Harbor, `https://harbor.kind.local:3443` | Developer (ordinary user), platform admin (administrator), local admin (`admin`, `/account/sign-in?always_sso_login=false`) | Browse projects and images; read scan results; get the CLI secret for `docker login`; manage projects, proxy caches and scan schedules | The port is part of the name: 80 and 443 stay reserved for the cluster ingress |
+| W7 | Vault, `https://vault.kind.local:8200/ui` | Developer (policy `default`), platform admin (policy `admin`), local admin (root token) | Read and write secrets under `secret/`; look at auth methods and policies | The OIDC login opens Keycloak in a popup |
+| W8 | RustFS console, `https://s3.kind.local:9001/rustfs/console/` | Developer in `platform-users` (read only), platform admin (everything), local admin (admin key) | Look into buckets and backups; manage buckets, users and policies | Someone in neither group cannot log in |
+| W9 | Applications, `https://testapp.kind.local`, `https://testapp-mesh.kind.local` and others | Developer | Try out a deployed workload through the default Ingress, the Istio gateway or a `LoadBalancer` address | No login of their own |
+
+### Command-line interfaces for people
+
+| ID | Interface | Who | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| C1 | `kubectl`, context `kind-dev` | Developer, platform admin | Apply manifests; read logs and events; `exec` into a pod; read backup snapshots and scan reports | Talks to the API server on the host's loopback at the port kind chose; cluster-admin for whoever has the kubeconfig |
+| C2 | `cli/k9s.sh`, `cli/lazydocker.sh` | Developer, platform admin | Watch and operate workloads; watch the containers on the host | Containers with pinned versions; k9s reaches the API server over the `kind` network with `cli/kubeconfig` |
+| C3 | `docker login`, `docker push` to `harbor.kind.local:3443` | Developer, platform admin | Publish an own image to the project `library` | OIDC users log in with the CLI secret from their Harbor profile. Needs the root CA in `/etc/docker/certs.d` once |
+| C4 | `git push` to GitHub | Developer, platform admin | Change what Argo CD deploys | The other half of S12 |
+| C5 | `applications/*/deploy.sh`, `applications/backup-demo/sync.sh` | Developer | Deploy a test application; back up or restore the demo database | `sync.sh` starts an Argo CD sync and waits for the result |
+| C6 | `vault` CLI, `vault login -method=oidc` | Developer, platform admin | Read and write secrets from a terminal | Logs in through the browser (callback on `localhost:8250`); the CLI also exists in the Vault container |
+| C7 | `cluster/cluster.sh`, `./deploy.sh`, `registry/kind-trust.sh`, `cluster/host-services-dns.sh` | Platform admin | Create and delete the cluster; deploy the platform; connect a new cluster to the host services | The whole platform comes back from these; they run as the local user |
+| C8 | `registry/`, `identity/`, `vault/`, `objectstore/` `setup-host.sh` | Platform admin | Install, start and reconfigure a host service; unseal Vault; create a namespace's bucket and keys | Idempotent; also the way to bring a service back after a reboot. They use the services' local accounts, so they are the scripted form of the local admin |
+| C9 | `vault/tf.sh`, `objectstore/rc.sh` | Platform admin | Change Vault's configuration as code; administer RustFS | Terraform and RustFS's client in containers, with the root token and the admin key |
+| C10 | `tests/run.sh` | Platform admin | Check every Keycloak login in a real browser | Playwright in a container on the `kind` network |
+| C11 | `pki/create-ca.sh` | Local admin | Create the root CA and the intermediates, once | The keys stay in `pki/out`, outside git |
+| C12 | `sudo storage/setup-host.sh`, `sudo storage/teardown-host.sh`, `sudo lvs` / `lvremove` | Local admin | Create or remove the volume group and `lvmd`; remove logical volumes left behind by a deleted cluster | The only part of the platform that needs root to run |
+| C13 | `./hosts.sh`, `sudo update-ca-certificates`, `certutil` | Local admin | Make the `*.kind.local` names resolve on the host; make the host and the browsers trust the root CA | `hosts.sh` asks for `sudo` only when `/etc/hosts` changes |
+| C14 | Local accounts from a terminal: `vault` with the root token, the Argo CD and Harbor `admin` passwords, the RustFS admin key | Local admin | Get back in when the Keycloak login is broken; bootstrap | Where each credential lives is listed under *Where the credentials live* |
+
 ## C4 container diagram
 
 ```mermaid
@@ -120,6 +255,76 @@ C4Container
     Rel(apps, rustfs, "Back up and restore their databases", "restic over HTTPS, started by K8up resources")
     Rel(rustfs, keycloak, "Console login for people", "OIDC")
 ```
+
+## Interfaces between host services and cluster services
+
+The system context lists what crosses the cluster's border. This section names
+the service on each end. Three things hold for every connection from the cluster
+to a host service:
+
+- **Address:** the host services publish their ports on the gateway address of
+  the `kind` Docker network (`172.21.0.1`), which is the host as seen from a
+  node or a pod.
+- **Name:** pods resolve `harbor.kind.local`, `keycloak.kind.local`,
+  `vault.kind.local` and `s3.kind.local` to that address through a `hosts` block
+  in CoreDNS, written by `cluster/host-services-dns.sh`. The nodes themselves
+  get `harbor.kind.local` in their `/etc/hosts` from `registry/kind-trust.sh`.
+- **Trust:** every host service has a certificate from the local CA. Pods verify
+  it with the root certificate that trust-manager puts into each namespace as
+  the ConfigMap `kind-root-ca`; the nodes' containerd gets it as a file.
+
+### From services in the cluster to services on the host
+
+| ID | From (cluster) → to (host) | Interface | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| K1 | containerd on every node → Harbor | OCI registry API, `https://harbor.kind.local:3443/v2/<project>/…` | Pull any image a pod needs: platform services, applications, backup and restore Jobs | Harbor is configured as a mirror per upstream registry in `/etc/containerd/certs.d/<registry>/hosts.toml`, with `override_path` to reach the proxy project. When Harbor does not answer, containerd falls back to the original registry |
+| K2 | containerd on every node → Harbor | The same API, project `library` | Pull images built and pushed locally | Image names carry the port: `harbor.kind.local:3443/library/…` |
+| K3 | Trivy Operator scan jobs (`trivy-system`) → Harbor | OCI registry API, through the proxy projects | Fetch the image of a running workload to scan it | `trivy.registry.mirror` rewrites every registry onto its Harbor project. Unlike containerd, Trivy has no fallback: without Harbor or without the CoreDNS name the scan fails |
+| K4 | `argocd-server` (`argocd`) → Keycloak | OIDC back channel, `https://keycloak.kind.local:8443/realms/localdev`: discovery, token endpoint, JWKS | Complete a person's login to the Argo CD UI; validate the token; read the `groups` claim for RBAC | Client `argocd`; the root CA is part of `oidc.config` (`rootCA`), so the issuer is verified, not skipped |
+| K5 | Grafana (`monitoring`) → Keycloak | OIDC back channel: `token_url` and `api_url` (userinfo) of the realm | Complete a person's login to Grafana; map the `groups` claim to `GrafanaAdmin`, `Editor` or `Viewer` | Client `grafana`, with PKCE; the client secret comes from the Secret `grafana-oidc` |
+| K6 | Service `keycloak.identity.svc.cluster.local` → Keycloak | An `ExternalName` Service pointing at `keycloak.kind.local:8443` | Give workloads a cluster-internal name for the identity provider | A name only; the issuer in tokens stays `keycloak.kind.local`, so clients that verify the issuer use that name |
+| K7 | External Secrets Operator (`external-secrets`) → Vault | Vault HTTP API, `https://vault.kind.local:8200/v1/auth/kubernetes/login` | Log in as the cluster | Sends a short-lived token of the service account `vault-auth`; Vault answers with a Vault token carrying the policy `eso-read` |
+| K8 | External Secrets Operator → Vault | Vault HTTP API, `/v1/secret/data/<path>` (KV v2) | Create a Kubernetes Secret from a Vault secret; refresh it on the `refreshInterval` | One `ClusterSecretStore` named `vault` serves every namespace. Used for the demo secret, the bucket keys under `secret/backup/<namespace>` and the demo database password |
+| K9 | K8up backup and prune Jobs (application namespace) → RustFS | S3 API, `https://s3.kind.local:9000/<namespace>`, as restic | Store a database dump; remove backups past the retention; list snapshots | The Job runs with the namespace's bucket key; the key cannot reach another bucket. The operator in `k8up-system` creates the Jobs but does not talk to RustFS itself |
+| K10 | Restore Jobs of the applications → RustFS | S3 API, the same bucket, as restic | Read a dump back to load it into the database | `restic dump` in the Job's first container; read-only use of the repository |
+| K11 | `topolvm-node` (DaemonSet, `topolvm-system`) → lvmd | gRPC over the Unix socket `/run/topolvm/lvmd.sock`, mounted into each node | Create, resize and delete the logical volume behind a claim; report free capacity per node | The controller in the cluster decides, `lvmd` on the host executes. The capacity it reports is what the scheduler uses to place pods |
+| K12 | kubelet on every node → volume group | Block devices `/dev/topolvm-vg/<volume>`, through the mounted `/dev` | Format and mount a volume into a pod | A node's own `/dev` is a copy; only the mount of the host's `/dev` makes new devices visible |
+
+No service in the cluster talks to cloud-provider-kind or to the local PKI at run
+time. No host service sends metrics, logs or traces into the cluster: the
+observability stack covers the cluster only.
+
+### From services on the host to services in the cluster
+
+| ID | From (host) → to (cluster) | Interface | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| N1 | cloud-provider-kind → Kubernetes API server | Kubernetes API (watch on Services, Ingresses, nodes), found through the Docker socket | Notice a new `LoadBalancer` Service or an Ingress of class `cloud-provider-kind`; write the assigned address into its status | Runs with host networking and the Docker socket. It also tries to install its own Gateway API CRDs at start, which is why `cluster/cluster.sh` installs them first |
+| N2 | `kindccm-*` Envoy containers → `argocd-server`, Grafana, test applications | TCP to the node ports of the backing Services, on the `kind` network | Carry a browser request for `argocd.kind.local`, `grafana.kind.local` or `testapp.kind.local` to its pod | One Envoy per namespace with Ingresses; TLS ends at the Envoy with a certificate issued by cert-manager |
+| N3 | `kindccm-*` Envoy containers → `istio-ingressgateway` (`istio-system`) | TCP to the gateway's node ports (80, 443) | Carry requests for Ingresses of class `istio` | One Envoy for the gateway's `LoadBalancer` Service; TLS ends at the Istio gateway |
+| N4 | `kindccm-*` Envoy containers → `LoadBalancer` Services of applications | TCP to the Service's node port | Reach a workload directly on its own address (layer 4) | For example the `nginx` Services of `testapp` and `testapp-mesh` |
+| N5 | Vault → Kubernetes API server | `TokenReview`, `https://dev-control-plane:6443`, verified with the cluster's CA | Check the service account token that the External Secrets Operator presented in K7 | Vault is a member of the `kind` network for this call alone. It authenticates with the token under review, so `vault-auth` is bound to `system:auth-delegator` |
+| N6 | k9s container (`cli/`) → Kubernetes API server | Kubernetes API, `https://dev-control-plane:6443`, with `cli/kubeconfig` | Watch and operate workloads from a terminal | The kubeconfig written by `kind get kubeconfig --internal` |
+| N7 | `kubectl` on the host → Kubernetes API server | Kubernetes API on the host's loopback, at the port kind chose | Everything the scripts and the people do with the cluster | The only published port of the cluster itself |
+| N8 | Playwright container (`tests/`) → Argo CD, Grafana | HTTPS to the Ingress addresses, on the `kind` network | Test the Keycloak logins in a real browser | Started by `tests/run.sh`, which passes the addresses as host entries |
+
+Harbor, Keycloak, RustFS and lvmd never open a connection into the cluster; they
+only answer.
+
+### Set-up interfaces: scripts that connect a cluster to the host services
+
+These are not running connections. Each is a script that copies something from
+one side to the other, and most have to run again after every
+`cluster/cluster.sh up`, because a new cluster has none of it.
+
+| ID | Script | From → to | Use cases | Description |
+| --- | --- | --- | --- | --- |
+| P1 | `registry/kind-trust.sh` | Harbor's name, the root CA and `registry/mirrors.tsv` → every node container | Make K1 and K2 possible | Writes `/etc/hosts` and `/etc/containerd/certs.d/` in the nodes with `docker exec`; only registries whose proxy project exists in Harbor get a mirror |
+| P2 | `cluster/host-services-dns.sh` | The names of the host services that are set up → ConfigMap `coredns` | Make K3 to K10 resolvable from pods | Adds a managed `hosts` block and restarts CoreDNS |
+| P3 | `platformservices/deploy.sh` | `pki/out` → Secrets `kind-issuing-ca` and `cacerts`, ConfigMap `kind-root-ca-source` | Let cert-manager issue certificates, Istio issue mesh certificates and trust-manager distribute the root | The CA keys reach the cluster as Secrets and are never in git |
+| P4 | `platformservices/deploy.sh` | `identity/out` → `argocd-secret`, `argocd-cm`, Secrets `grafana-admin` and `grafana-oidc` | Make K4 and K5 possible | Copies the OIDC client secrets that `identity/setup-host.sh` generated and registered in Keycloak |
+| P5 | `vault/setup-host.sh` | The cluster's CA (`kube-root-ca.crt`) → Vault's Kubernetes auth configuration | Make N5 possible | A new cluster has a new CA; the script reads it and applies it through Terraform |
+| P6 | `objectstore/setup-host.sh <namespace>` | RustFS bucket key and repository password → Vault, `secret/backup/<namespace>` | Make K9 and K10 possible | Runs once per namespace, not per cluster: the values stay the same across rebuilds, which is what lets a rebuilt application find its old backups |
+| P7 | `storage/setup-host.sh` and `cluster/cluster-config.yaml` | `/run/topolvm` and `/dev` on the host → `extraMounts` of every node | Make K11 and K12 possible | The mounts are fixed when the cluster is created. Recreating the socket directory on the host therefore needs a new cluster |
 
 ## Storage
 
@@ -555,6 +760,9 @@ Every password is generated, never committed: `identity/out/` and
 | Unseal key (Vault) | Unseals Vault after every start | `vault/out/unseal-key` |
 | Client `vault` | Confidential OIDC client | `identity/out/vault-client-secret`; also in Vault's `oidc` auth method and in `vault/config/terraform.tfstate` |
 | ServiceAccount `vault-auth` | ESO's login to Vault; bound to `system:auth-delegator` | nothing stored: short-lived tokens through TokenRequest |
+| Admin key (RustFS) | Everything in RustFS; used by `objectstore/setup-host.sh` and `objectstore/rc.sh` | `objectstore/out/admin/access-key` and `secret-key` |
+| Client `rustfs` | Confidential OIDC client | `identity/out/rustfs-client-secret`, stored in RustFS's provider configuration |
+| Bucket keys (RustFS) | One per namespace, limited to its bucket; with the restic repository password | `objectstore/out/keys/`, and in Vault at `secret/backup/<namespace>` |
 
 ### How group membership becomes rights
 
