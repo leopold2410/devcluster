@@ -119,3 +119,11 @@ elif ! kubectl -n monitoring get secret grafana-admin >/dev/null 2>&1; then
         --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -base64 18)"
 fi
 apply monitoring/grafana;         kubectl -n monitoring rollout status deployment/grafana --timeout=300s
+
+# 7. Security scanning (update-setup-08): the Trivy Operator scans every workload and stores the
+# findings as reports. Its scan jobs rewrite every image to Harbor's proxy cache, so they need
+# cluster/host-services-dns.sh for harbor.kind.local first - unlike containerd, Trivy has no
+# fallback to the upstream registry and the scan fails without it. trivy-server holds the
+# vulnerability database, which it downloads from mirror.gcr.io.
+apply trivy-operator;             available trivy-system
+kubectl -n trivy-system rollout status statefulset/trivy-server --timeout=300s

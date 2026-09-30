@@ -19,3 +19,4 @@ resources:
 - identity
 - argocd
 - monitoring
+- trivy-operator
